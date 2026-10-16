@@ -33,6 +33,7 @@
 #import <stdio.h>
 #import <stdlib.h>
 #import <string.h>
+#import <time.h>
 #import <unistd.h>
 
 #pragma mark - Tunables
@@ -400,7 +401,17 @@ static bool ov_build(RemoteCall *proc)
     gOvClsView      = clsView;
     gOvClsLabel     = clsLabel;
     gOvSlotsAllocated = 0;
-    ov_status("[5/6] 窗口已就绪；方框改为增量创建（每帧 1 对，共 %d 对）", slots);
+    ov_status("[5/6] 窗口已就绪；开始建 %d 个方框（每对之间 20ms，避免压崩目标）", slots);
+
+    /* 一次性建完，但每对之间歇 20ms：
+       连续密集远程调用到 ~19 次目标就会崩，而纯粹靠"每帧建一对"又要求 lara 一直前台
+       （用户切到游戏后 lara 被挂起，格子就永远建不完）。带节奏地建，约 0.5~0.8 秒
+       就在前台期间全部建好。 */
+    for (int i = 0; i < slots && !gOvBuildFailed; i++) {
+        ov_build_slots_step();
+        usleep(20 * 1000);
+    }
+    if (!gOvBuildFailed) ov_build_slots_step();      /* 补上准星 */
 
     ov_set_bool(win, "setHidden:", 0);
     if (r_responds(win, "resignKeyWindow")) r_msg2_main(win, "resignKeyWindow", 0, 0, 0, 0);
@@ -604,14 +615,25 @@ static void ov_tick(void)
     if (!gOvRunning) { pthread_mutex_unlock(&gOvLock); return; }
 
     ov_log_mute();                 /* 帧内静音，避免 (rc)/(pac) 刷爆日志 */
-    /* 先增量把方框/准星建起来（每帧一对），再画这一帧 */
+    /* 兜底：万一建格子循环没走完（例如前面崩过），这里继续把剩下的补上 */
     if (!gOvBuildFailed && !(gOvBuilderStep >= gOvSlotTarget && gOvCrossDone)) {
-        ov_log_unmute();           /* 建格子阶段要留日志，方便定位崩在哪 */
+        ov_log_unmute();
         ov_build_slots_step();
         ov_log_mute();
     }
     int drawn = ov_draw_snapshot();
     ov_log_unmute();
+
+    /* 挂起检测：tick 间隔明显变大说明 lara 被系统挂起了，画面会停住 */
+    {
+        static double last = 0;
+        double now = (double)clock_gettime_nsec_np(CLOCK_MONOTONIC) / 1e9;
+        if (last > 0.0 && now - last > 1.0) {
+            printf("(overlay) 注意：lara 被挂起了 %.1f 秒（悬浮层在挂起期间不会更新）\n", now - last);
+            fflush(stdout);
+        }
+        last = now;
+    }
 
     static unsigned tick = 0;
     if (++tick % (OV_TICK_HZ * 5) == 0) {          /* 每 5 秒一行摘要 */
