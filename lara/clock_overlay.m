@@ -190,9 +190,12 @@ static CGRect ov_content_frame(void)
     }
 
     if (gOvFullscreen) {
-        double top = gOvTop;
-        if (top < 0.0 || top > H - 120.0) top = 0.0;
-        return CGRectMake(0, top, W, H - top);
+        /* 方向不确定时最稳的做法：铺一个「长边 × 长边」的正方形覆盖整屏——
+           无论目标窗口空间是竖是横都被完全盖住，方向由页面自己旋转解决。 */
+        double side = (L > S) ? L : S;
+        double x = (W - side) / 2.0;
+        double y = (H - side) / 2.0;
+        return CGRectMake(x, y, side, side);
     }
 
     double width = W * gOvWidthRatio;
@@ -698,15 +701,21 @@ static bool ov_build(RemoteCall *proc)
     ov_set_bool(window, "setHidden:", 0);
     ov_set_bool(content, "setHidden:", 0);
     if (r_is_objc_ptr(gOvWeb)) ov_set_bool(gOvWeb, "setHidden:", 0);
+    /* 别让浮层窗口成为 key window：key 窗口在系统层面更容易拿到输入焦点。
+       （触摸穿透仍以 userInteractionEnabled=0 为主，这里是第二道保险。） */
+    if (r_responds(window, "resignKeyWindow")) {
+        r_msg2_main(window, "resignKeyWindow", 0, 0, 0, 0);
+    }
 
     uint64_t found = r_msg2_main(window, "viewWithTag:", (uint64_t)OV_TAG, 0, 0, 0);
     /* 回读校验：触摸穿透靠的就是这几个值必须是 0，日志里直接写出结果 */
     uint64_t winUI = r_msg2_main(window, "isUserInteractionEnabled", 0, 0, 0, 0);
     uint64_t webUI = r_is_objc_ptr(gOvWeb) ? r_msg2_main(gOvWeb, "isUserInteractionEnabled", 0, 0, 0, 0) : 0;
+    uint64_t winKey = r_msg2_main(window, "isKeyWindow", 0, 0, 0, 0);
     step++;
-    ov_status("[%d/6] 校验 tag=0x%llx(应为0x%llx) 内容=%s 窗口可交互=%u 网页可交互=%u（都应是 0）",
+    ov_status("[%d/6] 校验 tag=0x%llx(应为0x%llx) 内容=%s 窗口可交互=%u 网页可交互=%u 窗口是key=%u（前三个都应是 0）",
               step, found, content, gOvWebMode ? "第一视角" : "时间胶囊",
-              (unsigned)(winUI & 0xff), (unsigned)(webUI & 0xff));
+              (unsigned)(winUI & 0xff), (unsigned)(webUI & 0xff), (unsigned)(winKey & 0xff));
 
     gOvWindow = window;
     gOvPid = proc.pid;
