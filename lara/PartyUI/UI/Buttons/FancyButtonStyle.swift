@@ -9,11 +9,11 @@ import SwiftUI
 
 public struct FancyButtonStyle: PrimitiveButtonStyle {
     var color: Color = .accentColor
-    var shape: Shape
+    var shape: any Shape
     var useFullWidth: Bool
     @Environment(\.isEnabled) private var isEnabled
     
-    public init(color: Color = .accentColor, foregroundStyle: Color = .accentColor, shape: Shape = .rect(cornerRadius: cornerRad.component), useFullWidth: Bool = true) {
+    public init(color: Color = .accentColor, foregroundStyle: Color = .accentColor, shape: any Shape = .rect(cornerRadius: cornerRad.component), useFullWidth: Bool = true) {
         self.color = color
         self.shape = shape
         self.useFullWidth = useFullWidth
@@ -26,7 +26,7 @@ public struct FancyButtonStyle: PrimitiveButtonStyle {
                 .foregroundStyle(isEnabled ? color : .gray)
                 .frame(maxWidth: useFullWidth ? .infinity : nil)
                 .padding()
-                .glassEffect(.regular.interactive().tint(isEnabled ? color.opacity(0.2) : Color(.systemGray).opacity(0.2)), in: AnyShape(shape))
+                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
                 .onTapGesture(perform: configuration.trigger)
         } else {
             configuration.label

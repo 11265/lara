@@ -81,7 +81,7 @@ struct ActionBG: ViewModifier {
         } else {
             if #available(iOS 19.0, *) {
                 content
-                    .glassEffect(.clear.interactive(), in: .capsule)
+                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
             }
         }
     }
@@ -105,7 +105,7 @@ struct NotificationBG: ViewModifier {
         } else {
             if #available(iOS 19.0, *) {
                 content
-                    .glassEffect(.clear, in: .rect(cornerRadius: 26))
+                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
             }
         }
     }

@@ -736,7 +736,7 @@ func loadMutablePlistDictionary(from url: URL) throws -> NSMutableDictionary {
     return dict
 }
 
-func verifyPlist(_ plist: Any, targetPath: String) throws -> Data {
+@MainActor func verifyPlist(_ plist: Any, targetPath: String) throws -> Data {
     let fm = FileManager.default
     
     if fm.fileExists(atPath: targetPath) {

@@ -252,6 +252,30 @@ struct ToolsView: View {
             } header: {
                 Text("Sandbox")
             }
+
+            Section {
+                Toggle(isOn: Binding(
+                    get: { mgr.clockrunning },
+                    set: { on in
+                        if on {
+                            mgr.startClock()
+                        } else {
+                            mgr.stopClock()
+                        }
+                    }
+                )) {
+                    Text("Global Floating Clock")
+                }
+                .disabled(!mgr.rcready)
+
+                Text(mgr.rcready
+                     ? "Draws the current time in a pill above every app."
+                     : "Initialise the SpringBoard remote call first (main page → 初始化远程调用).")
+                    .font(.footnote)
+                    .foregroundColor(.secondary)
+            } header: {
+                Text("Floating Clock")
+            }
         }
         .navigationTitle("Tools")
         .alert("Status", isPresented: .constant(status != nil)) {
