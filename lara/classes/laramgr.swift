@@ -699,23 +699,12 @@ final class laramgr: ObservableObject {
 
     private var orientationObserver: NSObjectProtocol?
 
-    /// 把「设备方向 + 是否全屏」推给浮层。浮层按本机真实分辨率自己重排 frame：
+    /// 把「用户手选的方向 + 是否全屏」推给浮层。浮层按本机真实分辨率自己重排 frame：
     /// 横屏 = 长短边对调铺开，全屏 = 铺满整屏；不会重建浮层、不会重新加载页面。
+    /// 方向刻意**不做自动判断**：真机上 lara 侧与页面侧的信号都不可靠，直接听用户设置。
     func pushLayout() {
-        UIDevice.current.beginGeneratingDeviceOrientationNotifications()
-        if orientationObserver == nil {
-            orientationObserver = NotificationCenter.default.addObserver(
-                forName: UIDevice.orientationDidChangeNotification,
-                object: nil, queue: .main
-            ) { [weak self] _ in
-                self?.pushLayout()
-            }
-        }
-        let o = UIDevice.current.orientation
-        // 设备方向（不受 lara 自身是否锁定竖屏影响）；未知时沿用上次判断
-        if o.isLandscape || o.isPortrait {
-            lastLandscape = o.isLandscape
-        }
+        let orient = UserDefaults.standard.string(forKey: "fpvOrient") ?? "landscape"
+        lastLandscape = (orient != "portrait")            // 默认横屏
         let full = UserDefaults.standard.bool(forKey: "fpvFullscreen")
         clock_overlay_set_layout(lastLandscape ? 1 : 0, full ? 1 : 0)
     }

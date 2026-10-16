@@ -489,12 +489,10 @@ static void ov_tick(void)
         ov_push_text();
     }
 
-    /* 方向：每 3 秒问一次目标窗口方向（权威），拿不到才退回设备方向。
-       —— 真机上“界面横屏、悬浮层一直竖着”就是因为只信了 lara 侧的方向。 */
-    if (++gOvOrientTick >= 12) {                   /* 12 * 250ms = 3s */
-        gOvOrientTick = 0;
-        if (!ov_refresh_landscape()) ov_poll_orientation();
-    }
+    /* 方向由用户在设置里手选（横屏/竖屏），这里不再自动判断：
+       真机上无论是 lara 的 UIDevice.orientation（后台常报 unknown/竖屏）还是
+       页面的 screen.orientation.angle（跟接口方向），都不足以可靠判断，
+       所以直接听用户的设置，只按 gOvLandscape 重排。 */
 
     /* 方向（横竖屏）、全屏开关、分辨率变化：只重设 frame，页面不重建。 */
     double L = 0, S = 0;
@@ -690,10 +688,12 @@ static bool ov_build(RemoteCall *proc)
     r_msg2_main_raw(window, "setFrame:", &screen, sizeof(screen), NULL, 0, NULL, 0, NULL, 0);
     ov_set_bool(window, "setHidden:", 1);
 
-    /* 5/6 — content: 第一视角网页优先，失败退回时间胶囊。
-       frame 按当前方向/全屏/真实分辨率算（见 ov_content_frame）。 */
-    /* 建之前先问一次目标窗口方向：开局就对，避免先竖后横 */
-    ov_refresh_landscape();
+    /* 建之前先把用户选的方向读进来（设置里手选横屏/竖屏），开局就对。
+       顺便问一次目标窗口方向写进日志，仅用于诊断。 */
+    int io0 = ov_target_interface_orientation();
+    printf("(overlay) 用户选择方向=%s（目标窗口方向=%d，1竖2竖倒3横左4横右）\n",
+           gOvLandscape ? "横屏" : "竖屏", io0);
+    fflush(stdout);
     gOvWebMode = true;
     CGRect webFrame = ov_content_frame();
     gOvWebMode = false;

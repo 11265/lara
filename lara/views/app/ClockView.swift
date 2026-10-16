@@ -19,6 +19,7 @@ struct ClockView: View {
     @AppStorage("fpvTop") private var fpvTop: Double = 56
     @AppStorage("fpvFullscreen") private var fpvFullscreen: Bool = false
     @AppStorage("fpvHeight") private var fpvHeight: Double = 0
+    @AppStorage("fpvOrient") private var fpvOrient: String = "landscape"     // landscape（默认）/ portrait
     @AppStorage("fpvFov") private var fpvFov: Double = 90
     @AppStorage("fpvEye") private var fpvEye: Double = 1.6
     @AppStorage("fpvTau") private var fpvTau: Double = 70
@@ -90,7 +91,18 @@ struct ClockView: View {
             }
 
             Section {
-                Text("悬浮层盖住的地方，触摸会被系统丢弃（跨进程转发拿不到），所以把画面放到拇指区之外最省事。")
+                Picker("方向", selection: Binding(
+                    get: { fpvOrient },
+                    set: { fpvOrient = $0; mgr.pushLayout() }
+                )) {
+                    Text("横屏（默认）").tag("landscape")
+                    Text("竖屏").tag("portrait")
+                }
+                .pickerStyle(.segmented)
+                Text("方向由你手选、不做自动判断：悬浮层按所选方向重新铺开，**不会重新加载页面**。")
+                    .font(.footnote)
+                    .foregroundColor(.secondary)
+                Text("悬浮层盖住的地方，触摸会被系统丢弃（跨进程转发拿不到）。要完全不挡操作，用下面的预设把画面放到拇指区之外。")
                     .font(.footnote)
                     .foregroundColor(.secondary)
                 HStack(spacing: 8) {
