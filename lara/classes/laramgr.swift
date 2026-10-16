@@ -584,6 +584,8 @@ final class laramgr: ObservableObject {
                     self.rcLastError = nil
                     self.rcrunning = false
                     self.rcready = true
+                    // 先把上次异常退出留下的崩溃面包屑发到电脑（有就发，没有就算）
+                    self.uploadCrumbIfAny()
                     // 远程调用一就绪就自动显示全局悬浮·第一视角（除非上次是异常退出）
                     if self.consumeUncleanExitFlag() {
                         self.fpvOn = false
@@ -754,8 +756,30 @@ final class laramgr: ObservableObject {
         let eye = d.object(forKey: "fpvEye") as? Double ?? 1.6
         let dist = d.object(forKey: "fpvDist") != nil ? d.bool(forKey: "fpvDist") : true
         let cross = d.object(forKey: "fpvCross") != nil ? d.bool(forKey: "fpvCross") : true
-        clock_overlay_set_view(24, fov, eye, 0, dist ? 1 : 0, cross ? 1 : 0)
+        // 方框数量可选：默认 8（比 24 少一半以上远程调用与目标侧对象，先确认能不能稳）
+        let slots = d.object(forKey: "fpvSlots") as? Int ?? 8
+        clock_overlay_set_view(slots, fov, eye, 0, dist ? 1 : 0, cross ? 1 : 0)
         pushLayout()
+    }
+
+    // ── 崩溃面包屑：发现上次异常退出留下的文件就发给电脑上的服务 ──
+    private var crumbUploaded = false
+    func uploadCrumbIfAny() {
+        guard !crumbUploaded else { return }
+        crumbUploaded = true
+        guard let url = URL(string: fpvDataBase() + "/api/crumb") else { return }
+        let home = NSHomeDirectory()
+        let path = home + "/Documents/fpv-crumb.log"
+        guard let text = try? String(contentsOfFile: path, encoding: .utf8), !text.isEmpty else { return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("text/plain; charset=utf-8", forHTTPHeaderField: "Content-Type")
+        req.httpBody = text.data(using: .utf8)
+        req.timeoutInterval = 6
+        URLSession.shared.dataTask(with: req) { [weak self] _, _, err in
+            if let err { self?.logmsg("(fpv) 面包屑上传失败：\(err.localizedDescription)") }
+            else { self?.logmsg("(fpv) 已把上次崩溃面包屑上传到电脑（server.py 旁的 crumbs.log）") }
+        }.resume()
     }
 
     // ── 局域网数据：每 100ms 拉一次，压成 "self;x,y,z,kind;..." 交给浮层 ──
