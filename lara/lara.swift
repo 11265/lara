@@ -23,7 +23,6 @@ struct lara: App {
     @Environment(\.scenePhase) var scenephase
     @AppStorage("keepAlive") private var keepalive: Bool = false
     @AppStorage("logsdisplaymode") private var logsdisplaymode: logsdisplaymode = .toolbar
-    @AppStorage("captureShield") private var captureShield: Bool = true
     @State private var selectedtab: taboptions = .applying
 
     init() {
@@ -88,8 +87,6 @@ struct lara: App {
                 } else {
                     Alertinator.shared.alert(title: "此设备不受支持！", body: "非常抱歉，Lara 目前不支持此设备。可能的原因：\n- 你的 iOS 版本不受支持（支持的版本：iOS 16.0 - iOS 18.7.1、iOS 26.0 - iOS 26.0.1）\n- 你的设备具有 MIE（A19+ 或 M5+）\n- 已附加调试器。", actionLabel: "退出应用", action: { exitinator() })
                 }
-                // 全界面防录屏/防截屏：把整个界面放进安全输入层
-                CaptureShield.sync(enabled: captureShield)
             }
             .onChange(of: scenephase, perform: handleScenePhase)
         }
@@ -103,8 +100,7 @@ struct lara: App {
 
         case .active:
             globallogger.capture()
-            // 回前台：重新套上防录屏/防截屏，并确保悬浮时间还在
-            CaptureShield.sync(enabled: captureShield)
+            // 回到前台：确保悬浮时间还在
             if mgr.rcready && !mgr.clockrunning {
                 mgr.startClock()
             }
