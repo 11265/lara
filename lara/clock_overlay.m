@@ -66,11 +66,14 @@ static bool gOvFailed = false;
 static pid_t gOvPid = 0;
 
 static uint64_t gOvWindow = 0;
+static uint64_t gOvClip = 0;                     /* 裁剪容器：方框/文字画在里面（限制可见区域） */
 static uint64_t gOvBox[OV_MAX_SLOTS];
 static uint64_t gOvName[OV_MAX_SLOTS];
 static uint64_t gOvDist[OV_MAX_SLOTS];
-static uint64_t gOvCrossH = 0, gOvCrossV = 0;
+static uint64_t gOvCrossH = 0, gOvCrossV = 0;    /* 准星：直接挂在窗口上，钉在屏幕正中，不裁剪 */
 static int gOvSlotsAllocated = 0;
+static double gOvClipX = -1, gOvClipY = -1, gOvClipW = -1, gOvClipH = -1;   /* 裁剪容器当前位置 */
+static double gOvCrossCx = -1, gOvCrossCy = -1;                             /* 准星当前位置 */
 
 /* 增量建方框用的状态（建窗时只建窗口，方框每帧建一对，见 ov_build_slots_step） */
 static int gOvSlotTarget = 0;
@@ -246,6 +249,15 @@ static void ov_screen_sides(double *longSide, double *shortSide)
     *shortSide = (w > h) ? h : w;
 }
 
+/* 所选方向下的整屏尺寸（点）。投影 1:1 用整屏，裁剪区才用 ov_panel_rect。 */
+static void ov_screen_wh(double *W, double *H)
+{
+    double L = 0, S = 0;
+    ov_screen_sides(&L, &S);
+    *W = gOvLandscape ? L : S;
+    *H = gOvLandscape ? S : L;
+}
+
 /* 面板区域：横屏/竖屏 + 全屏/面板 + 宽高比例，全部按真实分辨率算。 */
 static void ov_panel_rect(double *px, double *py, double *pw, double *ph)
 {
@@ -344,10 +356,12 @@ static bool ov_build(RemoteCall *proc)
     ov_status("[%d/6] scene=0x%llx", step, scene);
     if (!r_is_objc_ptr(scene)) return false;
 
+    double sw = 0, sh = 0;
+    ov_screen_wh(&sw, &sh);
     double px = 0, py = 0, pw = 0, ph = 0;
     ov_panel_rect(&px, &py, &pw, &ph);
-    OV_Rect full = {0, 0, pw + px * 2.0, ph + py * 2.0};   /* 覆盖整屏（按所选方向） */
-    if (gOvFullscreen) { full.x = 0; full.y = 0; full.w = pw; full.h = ph; }
+    if (gOvFullscreen) { px = 0; py = 0; pw = sw; ph = sh; }
+    OV_Rect full = {0, 0, sw, sh};    /* 窗口铺满整屏：投影按整屏 1:1，方框可落在任意处 */
 
     uint64_t win = r_msg2_main(r_msg2_main(clsWin, "alloc", 0, 0, 0, 0), "initWithWindowScene:", scene, 0, 0, 0);
     if (!r_is_objc_ptr(win)) { step++; ov_status("[%d/6] 窗口创建失败", step); return false; }
@@ -359,9 +373,19 @@ static bool ov_build(RemoteCall *proc)
     uint64_t clear = r_is_objc_ptr(clsColor) ? r_msg2_main(clsColor, "clearColor", 0, 0, 0, 0) : 0;
     if (r_is_objc_ptr(clear)) r_msg2_main(win, "setBackgroundColor:", clear, 0, 0, 0);
     ov_set_bool(win, "setHidden:", 1);
+
+    /* 裁剪容器：方框/文字画在里面，用「宽度/顶部/高度」限制可见区域；
+       投影和准星不受它影响（都锚定屏幕正中，和游戏 1:1）。 */
+    gOvClipX = px; gOvClipY = py; gOvClipW = pw; gOvClipH = ph;
+    gOvClip = ov_make_view(clsView, clear, 0.0, 0, (OV_Rect){px, py, pw, ph}, false);
+    if (r_is_objc_ptr(gOvClip)) {
+        ov_set_bool(gOvClip, "setClipsToBounds:", 1);
+        r_msg2_main(win, "addSubview:", gOvClip, 0, 0, 0);
+    }
+
     step++;
-    ov_status("[%d/6] window=0x%llx 面板=%.0f,%.0f %.0fx%.0f 方向=%s%s",
-              step, win, px, py, pw, ph, gOvLandscape ? "横屏" : "竖屏", gOvFullscreen ? " 全屏" : "");
+    ov_status("[%d/6] window=0x%llx 投影=整屏%.0fx%.0f 裁剪区=%.0f,%.0f %.0fx%.0f 方向=%s%s",
+              step, win, sw, sh, px, py, pw, ph, gOvLandscape ? "横屏" : "竖屏", gOvFullscreen ? " 全屏" : "");
 
     /* 字体/颜色 */
     uint64_t font = 0;
@@ -440,6 +464,7 @@ static void ov_build_slots_step(void)
 
     if (gOvBuilderStep < gOvSlotTarget) {
         int i = gOvBuilderStep;
+        uint64_t host = r_is_objc_ptr(gOvClip) ? gOvClip : gOvWindow;
         OV_Rect r0 = {0, 0, 0, 0};
         uint64_t box = ov_make_view(gOvClsView, gOvClearColor, 2.0, gOvRedCGColor, r0, i == 0);
         if (!r_is_objc_ptr(box)) {
@@ -447,7 +472,7 @@ static void ov_build_slots_step(void)
             ov_status("[5/6] 第 %d 个方框创建失败（box=0x%llx，已用调用 %lu 次）", i, box, gOvCallCount);
             return;
         }
-        r_msg2_main(gOvWindow, "addSubview:", box, 0, 0, 0);
+        r_msg2_main(host, "addSubview:", box, 0, 0, 0);
         gOvBox[i] = box;
 
         OV_Rect r2 = {0, 0, 0, 0};
@@ -457,7 +482,7 @@ static void ov_build_slots_step(void)
             ov_status("[5/6] 第 %d 个文字创建失败（label=0x%llx，已用调用 %lu 次）", i, ds, gOvCallCount);
             return;
         }
-        r_msg2_main(gOvWindow, "addSubview:", ds, 0, 0, 0);
+        r_msg2_main(host, "addSubview:", ds, 0, 0, 0);
         gOvDist[i] = ds;
         gOvName[i] = 0;
         gOvCallCount += 6;
@@ -473,9 +498,9 @@ static void ov_build_slots_step(void)
 
     if (!gOvCrossDone) {
         gOvCrossDone = true;
-        double px = 0, py = 0, pw = 0, ph = 0;
-        ov_panel_rect(&px, &py, &pw, &ph);
-        double cx = px + pw / 2.0, cy = py + ph / 2.0;      /* 面板原点不能漏 */
+        double sw = 0, sh = 0;
+        ov_screen_wh(&sw, &sh);
+        double cx = sw / 2.0, cy = sh / 2.0;               /* 准星钉在屏幕正中（和游戏准星重合） */
         OV_Rect h = {cx - 9.0, cy - 0.75, 18.0, 1.5};
         OV_Rect v = {cx - 0.75, cy - 9.0, 1.5, 18.0};
         gOvCrossH = ov_make_view(gOvClsView, gOvWhiteColor, 0.0, 0, h, false);
@@ -484,18 +509,51 @@ static void ov_build_slots_step(void)
         if (r_is_objc_ptr(gOvCrossV)) r_msg2_main(gOvWindow, "addSubview:", gOvCrossV, 0, 0, 0);
         if (r_is_objc_ptr(gOvCrossH)) r_msg2_main(gOvCrossH, "setHidden:", gOvShowCross ? 0 : 1, 0, 0, 0);
         if (r_is_objc_ptr(gOvCrossV)) r_msg2_main(gOvCrossV, "setHidden:", gOvShowCross ? 0 : 1, 0, 0, 0);
+        gOvCrossCx = cx; gOvCrossCy = cy;
         ov_status("[5/6] 全部 %d 格 + 准星就绪（累计远程调用约 %lu 次）", gOvSlotsAllocated, gOvCallCount);
     }
 }
 
 #pragma mark - 每帧绘制
 
+/* 把裁剪容器摆到当前面板矩形，并把准星重新钉到屏幕正中。
+   只在几何真正变化时发远程调用，所以拖滑块/切方向才会重排，平时零开销。 */
+static void ov_sync_geometry(void)
+{
+    double sw = 0, sh = 0;
+    ov_screen_wh(&sw, &sh);
+    double px = 0, py = 0, pw = 0, ph = 0;
+    ov_panel_rect(&px, &py, &pw, &ph);
+    if (gOvFullscreen) { px = 0; py = 0; pw = sw; ph = sh; }
+
+    if (r_is_objc_ptr(gOvClip) &&
+        (gOvClipX != px || gOvClipY != py || gOvClipW != pw || gOvClipH != ph)) {
+        OV_Rect clip = {px, py, pw, ph};
+        ov_set_rect(gOvClip, "setFrame:", clip);
+        gOvClipX = px; gOvClipY = py; gOvClipW = pw; gOvClipH = ph;
+    }
+
+    /* 准星钉在屏幕正中（和游戏准星重合），与面板/裁剪区无关 */
+    double cx = sw / 2.0, cy = sh / 2.0;
+    if (gOvCrossCx != cx || gOvCrossCy != cy) {
+        if (r_is_objc_ptr(gOvCrossH)) {
+            OV_Rect h = {cx - 9.0, cy - 0.75, 18.0, 1.5};
+            ov_set_rect(gOvCrossH, "setFrame:", h);
+        }
+        if (r_is_objc_ptr(gOvCrossV)) {
+            OV_Rect v = {cx - 0.75, cy - 9.0, 1.5, 18.0};
+            ov_set_rect(gOvCrossV, "setFrame:", v);
+        }
+        gOvCrossCx = cx; gOvCrossCy = cy;
+    }
+}
+
 /* 解析一行快照并更新方框。返回画出来的方框数。
    带脏检查：frame/隐藏状态/距离数字与上次相同就完全不发远程调用。
 
    坐标约定（重要）：
-     · 方框加在**全屏窗口**上，所以投影算出来的面板局部坐标必须加上面板原点 (px,py)，
-       否则整幅画面会偏移一个面板位置（真机上就是"位置不对"）。
+     · 投影锚定**屏幕正中**（和游戏准星 1:1），算出来的是全屏坐标；
+       方框/文字画在裁剪容器里，所以 setFrame 时要减掉裁剪区原点 (gOvClipX,gOvClipY)。
      · UE 传来的 z 是胶囊中心（脚底上方约 0.9m），所以相机取 self_z + (眼高 - 0.9)，
        人物直接用自身 z，不再额外加身高。 */
 static int ov_draw_snapshot(void)
@@ -513,9 +571,12 @@ static int ov_draw_snapshot(void)
         return 0;
     }
 
-    double px = 0, py = 0, pw = 0, ph = 0;
-    ov_panel_rect(&px, &py, &pw, &ph);
-    if (pw < 8.0 || ph < 8.0) return 0;
+    double sw = 0, sh = 0;
+    ov_screen_wh(&sw, &sh);
+    if (sw < 8.0 || sh < 8.0) return 0;
+    ov_sync_geometry();
+    /* 裁剪容器原点：全屏坐标减掉它才是容器内坐标 */
+    double ox = gOvClipX, oy = gOvClipY;
 
     /* 自己 */
     char *p = gOvSnap;
@@ -537,7 +598,7 @@ static int ov_draw_snapshot(void)
     OV_Vec3 up = ov_cross(right, fwd);
 
     double tanHalfY = tan(gOvFov * M_PI / 360.0);
-    double aspect = pw / ph;
+    double aspect = sw / sh;
 
     char *semi = strchr(gOvSnap, ';');
     if (!semi) return 0;
@@ -561,20 +622,20 @@ static int ov_draw_snapshot(void)
         double ry = ov_dot(d, up) / depth;
         if (fabs(rx) > tanHalfY * aspect * 1.6 || fabs(ry) > tanHalfY * 1.6) continue;
 
-        /* 面板局部坐标 → 加上面板原点，才是全屏窗口上的坐标。
-           fov 是竖直视场角（与网页版 three.js 一致），横向像素偏移同样用 ph/2：
-           用 pw/2 会漏掉 aspect，横向被放大 pw/ph 倍（真机上就是"方向/位置都不对"）。 */
-        double cx = px + pw / 2.0 + rx * (ph / 2.0) / tanHalfY;
-        double cy = py + ph / 2.0 - ry * (ph / 2.0) / tanHalfY;
+        /* 投影锚定屏幕正中：fov 是竖直视场角（与网页版 three.js 一致），
+           横竖两个方向都用 sh/2——横向若用 sw/2 会漏掉 aspect，画面被横向拉伸。
+           得到的是全屏坐标，setFrame 时再减掉裁剪容器原点 (ox,oy)。 */
+        double cx = sw / 2.0 + rx * (sh / 2.0) / tanHalfY;
+        double cy = sh / 2.0 - ry * (sh / 2.0) / tanHalfY;
 
-        double boxH = OV_PERSON_HEIGHT / depth * (ph / 2.0) / tanHalfY;
+        double boxH = OV_PERSON_HEIGHT / depth * (sh / 2.0) / tanHalfY;
         if (boxH < OV_MIN_BOX_PX) boxH = OV_MIN_BOX_PX;
         double boxW = boxH * 0.52;
         if (drawn == 0) { gOvLastCx = cx; gOvLastCy = cy; gOvLastDepth = depth; }
 
         int i = drawn++;
         used[i] = true;
-        OV_Rect box = {cx - boxW / 2.0, cy - boxH / 2.0, boxW, boxH};
+        OV_Rect box = {cx - ox - boxW / 2.0, cy - oy - boxH / 2.0, boxW, boxH};
         int distM = (int)(depth + 0.5);
 
         OV_SlotCache *c = &gOvCache[i];
@@ -589,7 +650,7 @@ static int ov_draw_snapshot(void)
                 ov_set_rect(gOvBox[i], "setFrame:", box);
                 ov_set_bool(gOvBox[i], "setHidden:", 0);
                 if (r_is_objc_ptr(gOvDist[i])) {
-                    OV_Rect dl = {cx - 40.0, cy + boxH / 2.0 + 2.0, 80.0, 14.0};
+                    OV_Rect dl = {cx - ox - 40.0, cy - oy + boxH / 2.0 + 2.0, 80.0, 14.0};
                     ov_set_rect(gOvDist[i], "setFrame:", dl);
                     ov_set_bool(gOvDist[i], "setHidden:", gOvShowDist ? 0 : 1);
                 }
@@ -772,6 +833,9 @@ bool clock_overlay_start(RemoteCall *proc)
     }
 
     gOvWindow = 0;
+    gOvClip = 0;
+    gOvClipX = gOvClipY = gOvClipW = gOvClipH = -1;
+    gOvCrossCx = gOvCrossCy = -1;
     for (int i = 0; i < OV_MAX_SLOTS; i++) { gOvBox[i] = gOvName[i] = gOvDist[i] = 0; }
     gOvSlotsAllocated = 0;
 
@@ -794,6 +858,9 @@ bool clock_overlay_selftest(RemoteCall *proc)
     if (gOvTimer) { dispatch_source_cancel(gOvTimer); gOvTimer = nil; }
     if (r_is_objc_ptr(gOvWindow)) ov_set_bool(gOvWindow, "setHidden:", 1);
     gOvWindow = 0;
+    gOvClip = 0;
+    gOvClipX = gOvClipY = gOvClipW = gOvClipH = -1;
+    gOvCrossCx = gOvCrossCy = -1;
     for (int i = 0; i < OV_MAX_SLOTS; i++) { gOvBox[i] = gOvName[i] = gOvDist[i] = 0; }
     gOvCrossH = gOvCrossV = 0;
     gOvSlotsAllocated = 0;

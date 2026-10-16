@@ -124,7 +124,7 @@ struct ClockView: View {
                     Text("宽度")
                     Slider(value: Binding(
                         get: { fpvWidth },
-                        set: { fpvWidth = $0; mgr.pushLayout() }
+                        set: { fpvWidth = $0; mgr.refreshOverlayUrl() }
                     ), in: 0.3...1.0, step: 0.02)
                     Text("\(Int(fpvWidth * 100))%")
                         .font(.system(.caption, design: .monospaced))
@@ -135,7 +135,7 @@ struct ClockView: View {
                     Text("顶部距离")
                     Slider(value: Binding(
                         get: { fpvTop },
-                        set: { fpvTop = $0; mgr.pushLayout() }
+                        set: { fpvTop = $0; mgr.refreshOverlayUrl() }
                     ), in: 0...400, step: 4)
                     Text("\(Int(fpvTop))pt")
                         .font(.system(.caption, design: .monospaced))
@@ -145,7 +145,7 @@ struct ClockView: View {
                     Text("高度")
                     Slider(value: Binding(
                         get: { fpvHeight },
-                        set: { fpvHeight = $0; mgr.pushLayout() }
+                        set: { fpvHeight = $0; mgr.refreshOverlayUrl() }
                     ), in: 0...0.9, step: 0.05)
                     Text(fpvHeight == 0 ? "16:9" : "\(Int(fpvHeight * 100))% 屏高")
                         .font(.system(.caption, design: .monospaced))
@@ -159,7 +159,7 @@ struct ClockView: View {
             } header: {
                 Text("位置 · 尺寸 · 方向")
             } footer: {
-                Text("尺寸按本机真实分辨率算，横屏时自动按目标窗口方向铺开（不重新加载页面）。想完全不挡操作就用「顶部条」或「上半屏」，下半屏留给游戏。")
+                Text("投影和准星始终锚定屏幕正中、和游戏 1:1，不受这里影响；下面的尺寸只决定「哪块区域可见」（超出裁剪掉）。想完全不挡操作就用「顶部条」或「上半屏」，下半屏留给游戏。")
             }
 
             Section {
@@ -227,7 +227,7 @@ struct ClockView: View {
             fpvWidth = w
             fpvTop = top
             fpvHeight = h
-            mgr.pushLayout()
+            mgr.refreshOverlayUrl()
         }
         .buttonStyle(.bordered)
         .font(.caption)
