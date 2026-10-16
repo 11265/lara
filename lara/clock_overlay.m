@@ -428,7 +428,10 @@ static void ov_poll_orientation(void)
     });
 }
 
-/* 顺带问一下目标进程：它的窗口空间现在是什么方向（只用于日志诊断）。 */
+/* 问目标进程：它的窗口空间现在是什么方向（1竖 2竖倒 3横左 4横右，-1 未知）。
+   这是唯一可信的方向信号：lara 在后台时 UIDevice.orientation 常报 unknown/竖屏，
+   网页里的 screen.orientation.angle 跟的又是接口方向 —— 两者都解释不了真机上
+   “界面横屏了、悬浮层一直竖着”。SpringBoard 自己的 interfaceOrientation 会跟设备转。 */
 static int ov_target_interface_orientation(void)
 {
     uint64_t clsApp = r_class("UIApplication");
@@ -439,7 +442,16 @@ static int ov_target_interface_orientation(void)
     uint64_t scene = r_is_objc_ptr(scenes) ? r_msg2_main(scenes, "anyObject", 0, 0, 0, 0) : 0;
     if (!r_is_objc_ptr(scene)) return -1;
     uint64_t io = r_msg2_main(scene, "interfaceOrientation", 0, 0, 0, 0);
-    return (int)(io & 0xff);          /* 1=竖 2=竖倒 3=横左 4=横右 */
+    return (int)(io & 0xff);
+}
+
+/* 用目标窗口方向当权威判断；拿不到时才退回设备方向。 */
+static bool ov_refresh_landscape(void)
+{
+    int io = ov_target_interface_orientation();
+    if (io == 3 || io == 4) { gOvLandscape = 1; return true; }
+    if (io == 1 || io == 2) { gOvLandscape = 0; return true; }
+    return false;                      /* 未知：交给设备方向兜底 */
 }
 
 #pragma mark - Ticking
@@ -463,11 +475,11 @@ static void ov_tick(void)
         ov_push_text();
     }
 
-    /* 方向：自己在主线程轮询设备方向（每秒一次），横竖屏立刻跟上。
-       界面横屏而浮层不跟，就是因为以前只靠 lara 侧的通知，而游戏运行时 lara 在后台。 */
-    if (++gOvOrientTick >= 4) {                    /* 4 * 250ms = 1s */
+    /* 方向：每 3 秒问一次目标窗口方向（权威），拿不到才退回设备方向。
+       —— 真机上“界面横屏、悬浮层一直竖着”就是因为只信了 lara 侧的方向。 */
+    if (++gOvOrientTick >= 12) {                   /* 12 * 250ms = 3s */
         gOvOrientTick = 0;
-        ov_poll_orientation();
+        if (!ov_refresh_landscape()) ov_poll_orientation();
     }
 
     /* 方向（横竖屏）、全屏开关、分辨率变化：只重设 frame，页面不重建。 */
@@ -666,6 +678,8 @@ static bool ov_build(RemoteCall *proc)
 
     /* 5/6 — content: 第一视角网页优先，失败退回时间胶囊。
        frame 按当前方向/全屏/真实分辨率算（见 ov_content_frame）。 */
+    /* 建之前先问一次目标窗口方向：开局就对，避免先竖后横 */
+    ov_refresh_landscape();
     gOvWebMode = true;
     CGRect webFrame = ov_content_frame();
     gOvWebMode = false;
