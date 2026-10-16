@@ -276,7 +276,9 @@ static void ov_set_text(uint64_t obj, const char *utf8)
    读不到地址（可能不可映射）不下结论、继续；只有写失败/读回不一致才算坏。 */
 static bool ov_session_healthy(RemoteCall *proc, const char **why)
 {
-    bool conclusive_bad = false;
+    /* 只读探测：以前这里会往线程结构地址写回同一个值来验证写通道，但真机日志显示
+       那个内核地址常常不可映射（vmmapfindentry failed），对不可映射的内核地址写
+       很可能把远程会话弄坏 —— 得不偿失，改成只读。 */
     for (int attempt = 0; attempt < 3; attempt++) {
         r_settle_us(30000);
         usleep(80 * 1000);
@@ -284,16 +286,14 @@ static bool ov_session_healthy(RemoteCall *proc, const char **why)
         uint64_t addr = proc.trojanThreadAddr ? proc.trojanThreadAddr : proc.callThreadAddr;
         if (addr < 0x1000ULL) { *why = "拿不到目标线程结构地址"; continue; }
 
-        uint64_t before = [proc remoteRead64From:addr];
-        if (before == 0) { *why = "远程读取返回 0（地址可能不可映射）"; continue; }
-        if (![proc remote_write64:addr value:before]) { *why = "远程写入失败"; conclusive_bad = true; continue; }
-        if ([proc remoteRead64From:addr] != before) { *why = "远程读回不一致"; conclusive_bad = true; continue; }
+        uint64_t a = [proc remoteRead64From:addr];
+        uint64_t b = [proc remoteRead64From:addr];
+        if (a == 0 && b == 0) { *why = "远程读取返回 0（地址不可映射）"; continue; }
 
-        printf("(overlay) 健康检查 OK（addr=0x%llx）\n", addr);
+        printf("(overlay) 健康检查 OK（只读 addr=0x%llx 读回=0x%llx/0x%llx）\n", addr, a, b);
         fflush(stdout);
         return true;
     }
-    if (conclusive_bad) return false;
     printf("(overlay) 健康检查无结论，按可用处理\n");
     fflush(stdout);
     return true;
