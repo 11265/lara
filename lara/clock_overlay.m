@@ -85,6 +85,7 @@ static bool gOvBuilding = false;
 static bool gOvFailed = false;
 static unsigned gOvGuard = 0;      /* 触摸穿透自愈计数（每 120 个 tick = 30 秒一次） */
 static unsigned gOvWebWait = 0;    /* 网页加载等待计数（24 个 tick = 6 秒） */
+static unsigned gOvOrientTick = 0;  /* 方向轮询计数（4 个 tick = 1 秒） */
 
 /* 方向 / 全屏：由 lara 主线程用设备方向推过来（见 clock_overlay_set_layout）。
    目标进程的窗口空间跟随设备方向，所以横屏 = 长短边对调；尺寸全部按本机真实
@@ -220,9 +221,10 @@ static void ov_apply_layout(void)
     gOvAppliedFullscreen = gOvFullscreen;
     gOvAppliedW = W;
     gOvAppliedH = H;
-    ov_status("布局已更新：%s%s %.0fx%.0f → 内容 %.0f,%.0f %.0fx%.0f",
+    int io = ov_target_interface_orientation();
+    ov_status("布局已更新：设备=%s%s %.0fx%.0f → 内容 %.0f,%.0f %.0fx%.0f（目标窗口方向=%d，1竖2竖倒3横左4横右）",
               gOvLandscape ? "横屏" : "竖屏", gOvFullscreen ? " 全屏" : "",
-              W, H, content.origin.x, content.origin.y, content.size.width, content.size.height);
+              W, H, content.origin.x, content.origin.y, content.size.width, content.size.height, io);
 }
 
 const char *clock_overlay_url(void)
@@ -403,6 +405,36 @@ static uint64_t ov_build_pill(CGRect screen, CGRect frame)
     return pill;
 }
 
+/* 在 lara 自己的主线程上轮询设备方向：不依赖 UIDevice 通知。
+   原因：游戏运行时 lara 在后台，方向变化通知经常收不到，浮层就会一直停在
+   进 3D 那一刻的竖屏判断上（真机现象：界面横屏了，悬浮层不跟）。 */
+static void ov_poll_orientation(void)
+{
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIDeviceOrientation o = [UIDevice currentDevice].orientation;
+        if (o == UIDeviceOrientationLandscapeLeft || o == UIDeviceOrientationLandscapeRight) {
+            gOvLandscape = 1;
+        } else if (o == UIDeviceOrientationPortrait || o == UIDeviceOrientationPortraitUpsideDown) {
+            gOvLandscape = 0;
+        }
+        /* unknown / faceUp / faceDown：沿用上一次判断 */
+    });
+}
+
+/* 顺带问一下目标进程：它的窗口空间现在是什么方向（只用于日志诊断）。 */
+static int ov_target_interface_orientation(void)
+{
+    uint64_t clsApp = r_class("UIApplication");
+    if (!r_is_objc_ptr(clsApp)) return -1;
+    uint64_t app = r_msg2_main(clsApp, "sharedApplication", 0, 0, 0, 0);
+    if (!r_is_objc_ptr(app)) return -1;
+    uint64_t scenes = r_msg2_main(app, "connectedScenes", 0, 0, 0, 0);
+    uint64_t scene = r_is_objc_ptr(scenes) ? r_msg2_main(scenes, "anyObject", 0, 0, 0, 0) : 0;
+    if (!r_is_objc_ptr(scene)) return -1;
+    uint64_t io = r_msg2_main(scene, "interfaceOrientation", 0, 0, 0, 0);
+    return (int)(io & 0xff);          /* 1=竖 2=竖倒 3=横左 4=横右 */
+}
+
 #pragma mark - Ticking
 
 static void ov_tick(void)
@@ -422,6 +454,13 @@ static void ov_tick(void)
         }
     } else {
         ov_push_text();
+    }
+
+    /* 方向：自己在主线程轮询设备方向（每秒一次），横竖屏立刻跟上。
+       界面横屏而浮层不跟，就是因为以前只靠 lara 侧的通知，而游戏运行时 lara 在后台。 */
+    if (++gOvOrientTick >= 4) {                    /* 4 * 250ms = 1s */
+        gOvOrientTick = 0;
+        ov_poll_orientation();
     }
 
     /* 方向（横竖屏）、全屏开关、分辨率变化：只重设 frame，页面不重建。 */
