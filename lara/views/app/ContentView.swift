@@ -222,7 +222,7 @@ struct ContentView: View {
                     })
                 }
 
-                LabeledContent("全局悬浮时间") {
+                LabeledContent("全局悬浮 · 第一视角") {
                     Text(mgr.clockrunning ? "已显示" : "未显示")
                         .foregroundColor(mgr.clockrunning ? .green : .secondary)
                 }

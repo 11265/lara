@@ -575,7 +575,7 @@ final class laramgr: ObservableObject {
                     self.rcLastError = nil
                     self.rcrunning = false
                     self.rcready = true
-                    // 远程调用一就绪就自动显示全局悬浮时间
+                    // 远程调用一就绪就自动显示全局悬浮·第一视角
                     self.startClock()
                 } else {
                     self.logmsg("remote call init failed on \(process)")
@@ -691,24 +691,33 @@ final class laramgr: ObservableObject {
     }
     #endif
 
-    // ── Floating clock ──
+    // ── Floating overlay（全局悬浮·第一视角） ──
+
+    /// 第一视角页面的局域网地址（电脑上跑 rr/fpv 的 server.py）。
+    static let fpvDefaultURL = "http://192.168.137.1:18099/"
 
     func startClock() {
         guard dsready, let sbProc, !clockrunning else { return }
-        // 悬浮时间由 lara 进程驱动，lara 被挂起就会停走：自动打开后台保活
+        // 悬浮层由 lara 进程驱动，lara 被挂起就会停：自动打开后台保活
         if !kaenabled {
             toggleka()
             UserDefaults.standard.set(true, forKey: "keepAlive")
-            logmsg("(clock) 已自动开启后台保活")
+            logmsg("(fpv) 已自动开启后台保活")
         }
-        logmsg("(clock) starting floating clock...")
+        // 页面地址与尺寸来自设置（悬浮时钟页）
+        let url = UserDefaults.standard.string(forKey: "fpvURL") ?? Self.fpvDefaultURL
+        let ratio = UserDefaults.standard.object(forKey: "fpvWidth") as? Double ?? 0.92
+        let top = UserDefaults.standard.object(forKey: "fpvTop") as? Double ?? 56.0
+        url.withCString { clock_overlay_set_url($0) }
+        clock_overlay_set_geometry(ratio, top)
+        logmsg("(fpv) 开始加载第一视角：\(url)（宽 \(Int(ratio * 100))%）")
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let ok = clock_overlay_start(sbProc)
             let status = String(cString: clock_overlay_status())
             DispatchQueue.main.async {
                 self?.clockrunning = ok
                 self?.clockstatus = status
-                self?.logmsg(ok ? "(clock) \(status)" : "(clock) 失败：\(status)")
+                self?.logmsg(ok ? "(fpv) \(status)" : "(fpv) 失败：\(status)")
             }
         }
     }
@@ -719,14 +728,14 @@ final class laramgr: ObservableObject {
             clockrunning = false
             return
         }
-        logmsg("(clock) stopping floating clock...")
+        logmsg("(fpv) 隐藏悬浮第一视角...")
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             clock_overlay_stop(sbProc)
             let status = String(cString: clock_overlay_status())
             DispatchQueue.main.async {
                 self?.clockrunning = false
                 self?.clockstatus = status
-                self?.logmsg("(clock) \(status)")
+                self?.logmsg("(fpv) \(status)")
             }
         }
     }

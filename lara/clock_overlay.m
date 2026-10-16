@@ -2,27 +2,26 @@
 //  clock_overlay.m
 //  lara
 //
-//  Global floating clock — cosmetic only.
+//  Global floating overlay = 第一视角（FPS）雷达。
 //
-//  A small pill showing this device's local time, drawn by SpringBoard so it
-//  floats above apps. The only data source is [NSDate date] in this process:
-//  no memory reads, no other process' data, no capture-blocking side effects.
+//  浮层由 SpringBoard 绘制（所以能浮在所有应用之上）。内容优先用 WKWebView
+//  加载局域网页面 http://<电脑IP>:<端口>/（rr/fpv 服务，数据来自电脑上的解析
+//  核心）；如果目标进程里拿不到 WKWebView，就退回原来的时间胶囊。
 //
-//  Why it is written this way (from on-device logs):
-//   1. Every target-side call goes through remote_objc's r_msg2_main* family
-//      (NSInvocation + -performSelectorOnMainThread:). Plain remote_msg issues a
-//      raw objc_msgSend on the hijacked thread, which killed the trojan thread on
-//      the first object method ([UILabel init]) on this device.
-//   2. No struct-returning remote calls: reading [UIScreen mainScreen].bounds
-//      remotely trapped the target. The geometry is read locally instead — lara is
-//      an app on the same screen, so it sees the same rectangle for free.
-//   3. The call shape is the one the peace_esp overlay used successfully here:
-//      connectedScenes.anyObject, alloc + initWithWindowScene: for the window,
-//      alloc + init for views, r_nsstr_retained + CFRelease for strings,
-//      r_settle_us(1500).
+//  为什么沿用旧的调用形态（来自真机日志的教训）：
+//   1. 所有目标侧调用都走 remote_objc 的 r_msg2_main* 家族
+//      (NSInvocation + -performSelectorOnMainThread:)。直接 remote_msg 会在
+//      hijack 线程上裸调 objc_msgSend，在这台设备上第一次对象方法调用就打死线程。
+//   2. 不做“返回结构体”的远程调用：远程读 [UIScreen mainScreen].bounds 会把目标
+//      卡死。几何一律在本地读（lara 与 SpringBoard 同一块屏幕）。
+//   3. 带结构体参数（CGRect 等）的调用用 r_msg2_main_raw 传指针 + 长度，
+//      与旧的 setWindowLevel:/setFrame: 完全一致。
 //
-//  Steps print "(clock) [n/6] ..." to stdout, which lara's logger captures, so
-//  lara.log always ends at the last call that came back.
+//  地址与尺寸可热改：主进程把偏好写进 UserDefaults，这里的定时器每秒比对一次，
+//  变了就重新 loadRequest，不用重启 lara。
+//
+//  每一步都会打印 "(overlay) [n/m] ..." 到 stdout，由 lara 的日志捕获，
+//  日志停在哪个编号就说明哪一步把远程调用弄死了。
 //
 
 #import "clock_overlay.h"
@@ -39,39 +38,81 @@
 
 #pragma mark - Tunables
 
-#define CLOCK_TAG            0x1A2B3C4DULL
-#define CLOCK_WINDOW_LEVEL   999999.0   /* above app windows and alerts */
-#define CLOCK_WIDTH          92.0
-#define CLOCK_HEIGHT         26.0
-#define CLOCK_CORNER_RADIUS  8.0
-#define CLOCK_FONT_SIZE      15.0
-#define CLOCK_TOP            62.0       /* clear of the status bar / notch */
-#define CLOCK_TICK_MS        250ULL     /* poll 4x/s, push a string only when the second flips */
-#define CLOCK_TEXT_MAX       16
-#define CLOCK_STATUS_MAX     512
+#define OV_TAG                0x1A2B3C4DULL
+#define OV_WINDOW_LEVEL       999999.0   /* above app windows and alerts */
+#define OV_DEFAULT_URL        "http://192.168.137.1:18099/"
+#define OV_URL_MAX            256
+#define OV_STATUS_MAX         512
+#define OV_TICK_MS            250ULL     /* 4x/s：胶囊走秒；网页每 OV_URL_CHECK_TICKS 次比对地址 */
+#define OV_URL_CHECK_TICKS    4          /* 4 * 250ms = 1s 检查一次地址变化 */
+
+/* 胶囊（退回方案）外观 */
+#define OV_PILL_WIDTH         92.0
+#define OV_PILL_HEIGHT        26.0
+#define OV_PILL_RADIUS        8.0
+#define OV_PILL_FONT          15.0
+#define OV_PILL_TEXT_MAX      16
+
+/* 第一视角浮层默认几何 */
+#define OV_WEB_WIDTH_RATIO    0.92       /* 屏宽占比 */
+#define OV_WEB_TOP            56.0       /* 避开状态栏/刘海 */
+#define OV_WEB_ASPECT         9.0 / 16.0 /* 高 = 宽 * 9/16 */
 
 #pragma mark - State
 
-static pthread_mutex_t gClockLock = PTHREAD_MUTEX_INITIALIZER;
-static dispatch_source_t gClockTimer = nil;
-static bool gClockRunning = false;
-static pid_t gClockPid = 0;
-static uint64_t gClockWindow = 0;
-static uint64_t gClockPill = 0;
-static char gClockLastText[CLOCK_TEXT_MAX] = {0};
-static char gClockStatus[CLOCK_STATUS_MAX] = "尚未启动";
+static pthread_mutex_t gOvLock = PTHREAD_MUTEX_INITIALIZER;
+static dispatch_source_t gOvTimer = nil;
+static bool gOvRunning = false;
+static pid_t gOvPid = 0;
+static uint64_t gOvWindow = 0;
+static uint64_t gOvPill = 0;             /* 退回方案：时间胶囊 */
+static uint64_t gOvWeb = 0;              /* 主方案：WKWebView */
+static bool gOvWebMode = false;
+static char gOvLastText[OV_PILL_TEXT_MAX] = {0};
+static char gOvStatus[OV_STATUS_MAX] = "尚未启动";
+static char gOvUrl[OV_URL_MAX] = OV_DEFAULT_URL;
+static char gOvUrlLoaded[OV_URL_MAX] = {0};
+static double gOvWidthRatio = OV_WEB_WIDTH_RATIO;
+static double gOvTop = OV_WEB_TOP;
+static unsigned gOvTick = 0;
 
-static void clock_status(const char *fmt, ...)
+static void ov_status(const char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(gClockStatus, sizeof(gClockStatus), fmt, ap);
+    vsnprintf(gOvStatus, sizeof(gOvStatus), fmt, ap);
     va_end(ap);
-    printf("(clock) %s\n", gClockStatus);
+    printf("(overlay) %s\n", gOvStatus);
     fflush(stdout);
 }
 
-static NSDateFormatter *clock_formatter(void)
+#pragma mark - Config (called from lara's process)
+
+void clock_overlay_set_url(const char *url)
+{
+    if (!url || !url[0]) {
+        strncpy(gOvUrl, OV_DEFAULT_URL, sizeof(gOvUrl) - 1);
+        gOvUrl[sizeof(gOvUrl) - 1] = '\0';
+        return;
+    }
+    strncpy(gOvUrl, url, sizeof(gOvUrl) - 1);
+    gOvUrl[sizeof(gOvUrl) - 1] = '\0';
+}
+
+void clock_overlay_set_geometry(double widthRatio, double topMargin)
+{
+    gOvWidthRatio = (widthRatio >= 0.2 && widthRatio <= 1.0) ? widthRatio : OV_WEB_WIDTH_RATIO;
+    gOvTop = (topMargin >= 0.0 && topMargin <= 600.0) ? topMargin : OV_WEB_TOP;
+}
+
+const char *clock_overlay_url(void)
+{
+    return gOvUrl;
+}
+
+#pragma mark - 时间胶囊（退回方案）
+
+static NSDateFormatter *ov_formatter(void)
 {
     static NSDateFormatter *fmt = nil;
     if (!fmt) {
@@ -83,59 +124,206 @@ static NSDateFormatter *clock_formatter(void)
 }
 
 /* Pushes the current time into the pill (main thread, one call per second).
-   Caller must hold gClockLock. */
-static void clock_push_text(void)
+   Caller must hold gOvLock. */
+static void ov_push_text(void)
 {
-    if (!r_is_objc_ptr(gClockPill)) return;
+    if (!r_is_objc_ptr(gOvPill)) return;
 
-    const char *cstr = [clock_formatter() stringFromDate:[NSDate date]].UTF8String;
+    const char *cstr = [ov_formatter() stringFromDate:[NSDate date]].UTF8String;
     if (!cstr) return;
-    if (strncmp(cstr, gClockLastText, sizeof(gClockLastText)) == 0) return;
+    if (strncmp(cstr, gOvLastText, sizeof(gOvLastText)) == 0) return;
 
-    strncpy(gClockLastText, cstr, sizeof(gClockLastText) - 1);
-    gClockLastText[sizeof(gClockLastText) - 1] = '\0';
+    strncpy(gOvLastText, cstr, sizeof(gOvLastText) - 1);
+    gOvLastText[sizeof(gOvLastText) - 1] = '\0';
 
     uint64_t str = r_nsstr_retained(cstr);          /* +1 in the target */
     if (!r_is_objc_ptr(str)) return;
-    r_msg2_main(gClockPill, "setText:", str, 0, 0, 0);
+    r_msg2_main(gOvPill, "setText:", str, 0, 0, 0);
     r_dlsym_call(R_TIMEOUT, "CFRelease", str, 0, 0, 0, 0, 0, 0, 0);
+}
+
+#pragma mark - 第一视角网页（主方案）
+
+/* 让 WKWebView 加载 gOvUrl（可在主线程之外调用，内部用的都是 r_msg2_main*）。
+   Caller must hold gOvLock. */
+static void ov_load_url(void)
+{
+    if (!r_is_objc_ptr(gOvWeb) || !gOvUrl[0]) return;
+
+    uint64_t clsNSURL = r_class("NSURL");
+    uint64_t clsReq   = r_class("NSURLRequest");
+    if (!r_is_objc_ptr(clsNSURL) || !r_is_objc_ptr(clsReq)) {
+        ov_status("网页失败：找不到 NSURL/NSURLRequest");
+        return;
+    }
+
+    uint64_t str = r_nsstr_retained(gOvUrl);
+    if (!r_is_objc_ptr(str)) { ov_status("网页失败：地址字符串创建失败"); return; }
+
+    uint64_t nsurl = r_msg2_main(clsNSURL, "URLWithString:", str, 0, 0, 0);
+    r_dlsym_call(R_TIMEOUT, "CFRelease", str, 0, 0, 0, 0, 0, 0, 0);
+    if (!r_is_objc_ptr(nsurl)) { ov_status("网页失败：URL 解析失败（%s）", gOvUrl); return; }
+
+    uint64_t req = r_msg2_main(clsReq, "requestWithURL:", nsurl, 0, 0, 0);
+    if (!r_is_objc_ptr(req)) { ov_status("网页失败：NSURLRequest 创建失败"); return; }
+
+    r_msg2_main(gOvWeb, "loadRequest:", req, 0, 0, 0);
+    strncpy(gOvUrlLoaded, gOvUrl, sizeof(gOvUrlLoaded) - 1);
+    gOvUrlLoaded[sizeof(gOvUrlLoaded) - 1] = '\0';
+    ov_status("第一视角已加载：%s", gOvUrl);
+}
+
+/* 建 WKWebView；失败返回 0。 */
+static uint64_t ov_build_web(RemoteCall *proc, CGRect screen, CGRect frame)
+{
+    uint64_t clsWeb = r_class("WKWebView");
+    uint64_t clsCfg = r_class("WKWebViewConfiguration");
+    if (!r_is_objc_ptr(clsWeb) || !r_is_objc_ptr(clsCfg)) {
+        printf("(overlay) 目标进程没有 WKWebView（web=0x%llx cfg=0x%llx），改用时间胶囊\n",
+               clsWeb, clsCfg);
+        fflush(stdout);
+        return 0;
+    }
+
+    uint64_t cfgAlloc = r_msg2_main(clsCfg, "alloc", 0, 0, 0, 0);
+    uint64_t cfg = r_is_objc_ptr(cfgAlloc) ? r_msg2_main(cfgAlloc, "init", 0, 0, 0, 0) : 0;
+    if (!r_is_objc_ptr(cfg)) { ov_status("网页失败：WKWebViewConfiguration 创建失败"); return 0; }
+
+    uint64_t webAlloc = r_msg2_main(clsWeb, "alloc", 0, 0, 0, 0);
+    if (!r_is_objc_ptr(webAlloc)) { ov_status("网页失败：WKWebView alloc 失败"); return 0; }
+
+    /* initWithFrame:configuration: —— 结构体 + 对象指针一起走 raw 形态 */
+    uint64_t cfgVal = cfg;
+    uint64_t web = r_msg2_main_raw(webAlloc, "initWithFrame:configuration:",
+                                   &frame, sizeof(frame), &cfgVal, sizeof(cfgVal),
+                                   NULL, 0, NULL, 0);
+    if (!r_is_objc_ptr(web)) { ov_status("网页失败：WKWebView init 失败"); return 0; }
+
+    /* 外观与行为：透明底、不可滚动、不吃触摸（浮层不能挡住游戏操作） */
+    uint64_t clsColor = r_class("UIColor");
+    if (r_is_objc_ptr(clsColor)) {
+        uint64_t clear = r_msg2_main(clsColor, "clearColor", 0, 0, 0, 0);
+        if (r_is_objc_ptr(clear)) r_msg2_main(web, "setBackgroundColor:", clear, 0, 0, 0);
+    }
+    r_msg2_main(web, "setUserInteractionEnabled:", 0, 0, 0, 0);
+    r_msg2_main(web, "setOpaque:", 0, 0, 0, 0);
+    uint64_t scroll = r_msg2_main(web, "scrollView", 0, 0, 0, 0);
+    if (r_is_objc_ptr(scroll)) {
+        r_msg2_main(scroll, "setScrollEnabled:", 0, 0, 0, 0);
+        r_msg2_main(scroll, "setBounces:", 0, 0, 0, 0);
+        r_msg2_main(scroll, "setShowsVerticalScrollIndicator:", 0, 0, 0, 0);
+        r_msg2_main(scroll, "setShowsHorizontalScrollIndicator:", 0, 0, 0, 0);
+    }
+    uint64_t layer = r_msg2_main(web, "layer", 0, 0, 0, 0);
+    if (r_is_objc_ptr(layer)) {
+        double radius = 14.0;
+        r_msg2_main_raw(layer, "setCornerRadius:", &radius, sizeof(radius), NULL, 0, NULL, 0, NULL, 0);
+        r_msg2_main(layer, "setMasksToBounds:", 1, 0, 0, 0);
+    }
+    double opacity = 0.96;
+    r_msg2_main_raw(web, "setAlpha:", &opacity, sizeof(opacity), NULL, 0, NULL, 0, NULL, 0);
+    r_msg2_main(web, "setTag:", (uint64_t)OV_TAG, 0, 0, 0);
+    (void)proc;
+    (void)screen;
+
+    gOvWeb = web;
+    gOvWebMode = true;
+    ov_load_url();
+    return web;
+}
+
+/* 建时间胶囊；失败返回 0。 */
+static uint64_t ov_build_pill(CGRect screen, CGRect frame)
+{
+    uint64_t clsLabel = r_class("UILabel");
+    uint64_t clsColor = r_class("UIColor");
+    uint64_t clsFont  = r_class("UIFont");
+    if (!r_is_objc_ptr(clsLabel)) { ov_status("胶囊失败：找不到 UILabel"); return 0; }
+
+    uint64_t allocatedLabel = r_msg2_main(clsLabel, "alloc", 0, 0, 0, 0);
+    uint64_t pill = r_is_objc_ptr(allocatedLabel) ? r_msg2_main(allocatedLabel, "init", 0, 0, 0, 0) : 0;
+    if (!r_is_objc_ptr(pill)) { ov_status("胶囊失败：UILabel init 失败"); return 0; }
+
+    double fontSize = OV_PILL_FONT;
+    uint64_t font = r_is_objc_ptr(clsFont)
+        ? r_msg2_main_raw(clsFont, "systemFontOfSize:", &fontSize, sizeof(fontSize), NULL, 0, NULL, 0, NULL, 0)
+        : 0;
+    if (r_is_objc_ptr(font)) r_msg2_main(pill, "setFont:", font, 0, 0, 0);
+    r_msg2_main(pill, "setTextAlignment:", 1 /* centre */, 0, 0, 0);
+    r_msg2_main(pill, "setNumberOfLines:", 1, 0, 0, 0);
+    r_msg2_main(pill, "setClipsToBounds:", 1, 0, 0, 0);
+    if (r_is_objc_ptr(clsColor)) {
+        uint64_t white = r_msg2_main(clsColor, "whiteColor", 0, 0, 0, 0);
+        uint64_t black = r_msg2_main(clsColor, "blackColor", 0, 0, 0, 0);
+        if (r_is_objc_ptr(white)) r_msg2_main(pill, "setTextColor:", white, 0, 0, 0);
+        if (r_is_objc_ptr(black)) r_msg2_main(pill, "setBackgroundColor:", black, 0, 0, 0);
+    }
+    uint64_t layer = r_msg2_main(pill, "layer", 0, 0, 0, 0);
+    if (r_is_objc_ptr(layer)) {
+        double radius = OV_PILL_RADIUS;
+        r_msg2_main_raw(layer, "setCornerRadius:", &radius, sizeof(radius), NULL, 0, NULL, 0, NULL, 0);
+    }
+    r_msg2_main_raw(pill, "setFrame:", &frame, sizeof(frame), NULL, 0, NULL, 0, NULL, 0);
+    r_msg2_main(pill, "setTag:", (uint64_t)OV_TAG, 0, 0, 0);
+    (void)screen;
+
+    gOvPill = pill;
+    gOvWebMode = false;
+    ov_push_text();
+    return pill;
 }
 
 #pragma mark - Ticking
 
-static void clock_start_timer(RemoteCall *proc)
+static void ov_tick(void)
 {
-    if (gClockTimer) return;
+    pthread_mutex_lock(&gOvLock);
+    if (!gOvRunning) { pthread_mutex_unlock(&gOvLock); return; }
+
+    if (gOvWebMode) {
+        /* 每秒比对一次地址：主进程改了偏好就热重载，不用重启 lara */
+        if (++gOvTick >= OV_URL_CHECK_TICKS) {
+            gOvTick = 0;
+            if (strncmp(gOvUrl, gOvUrlLoaded, sizeof(gOvUrl)) != 0) {
+                printf("(overlay) 地址变化：%s -> %s，重新加载\n", gOvUrlLoaded, gOvUrl);
+                fflush(stdout);
+                ov_load_url();
+            }
+        }
+    } else {
+        ov_push_text();
+    }
+    pthread_mutex_unlock(&gOvLock);
+}
+
+static void ov_start_timer(RemoteCall *proc)
+{
+    if (gOvTimer) return;
 
     dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
                                                      dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0));
     if (!timer) {
-        printf("(clock) 定时器创建失败\n");
+        printf("(overlay) 定时器创建失败\n");
         fflush(stdout);
         return;
     }
-
     dispatch_source_set_timer(timer,
                               dispatch_time(DISPATCH_TIME_NOW, 0),
-                              CLOCK_TICK_MS * NSEC_PER_MSEC,
+                              OV_TICK_MS * NSEC_PER_MSEC,
                               100 * NSEC_PER_MSEC);
-
-    /* `proc` is captured strongly so the RemoteCall stays alive while ticking. */
     dispatch_source_set_event_handler(timer, ^{
-        pthread_mutex_lock(&gClockLock);
-        if (gClockRunning) clock_push_text();
-        pthread_mutex_unlock(&gClockLock);
+        ov_tick();
     });
-
-    gClockTimer = timer;
-    dispatch_resume(gClockTimer);
+    gOvTimer = timer;
+    dispatch_resume(gOvTimer);
+    (void)proc;
 }
 
 #pragma mark - Build
 
 /* Numbered steps, printed as we go: the last line in lara.log is the last call
    that came back alive. */
-static bool clock_build(RemoteCall *proc)
+static bool ov_build(RemoteCall *proc)
 {
     int step = 0;
 
@@ -146,27 +334,23 @@ static bool clock_build(RemoteCall *proc)
     /* 1/6 — classes. */
     uint64_t clsApplication = r_class("UIApplication");
     uint64_t clsWindow      = r_class("UIWindow");
-    uint64_t clsLabel       = r_class("UILabel");
     uint64_t clsColor       = r_class("UIColor");
-    uint64_t clsFont        = r_class("UIFont");
     step++;
-    clock_status("[%d/6] 类: app=0x%llx win=0x%llx label=0x%llx color=0x%llx font=0x%llx",
-                 step, clsApplication, clsWindow, clsLabel, clsColor, clsFont);
-    if (!r_is_objc_ptr(clsApplication) || !r_is_objc_ptr(clsWindow) || !r_is_objc_ptr(clsLabel)) {
-        return false;
-    }
+    ov_status("[%d/6] 类: app=0x%llx win=0x%llx color=0x%llx",
+              step, clsApplication, clsWindow, clsColor);
+    if (!r_is_objc_ptr(clsApplication) || !r_is_objc_ptr(clsWindow)) return false;
 
     /* 2/6 — application object. */
     uint64_t app = r_msg2_main(clsApplication, "sharedApplication", 0, 0, 0, 0);
     step++;
-    clock_status("[%d/6] sharedApplication=0x%llx", step, app);
+    ov_status("[%d/6] sharedApplication=0x%llx", step, app);
     if (!r_is_objc_ptr(app)) return false;
 
     /* 3/6 — the scene to host the window on. */
     uint64_t scenes = r_msg2_main(app, "connectedScenes", 0, 0, 0, 0);
     uint64_t scene = r_is_objc_ptr(scenes) ? r_msg2_main(scenes, "anyObject", 0, 0, 0, 0) : 0;
     step++;
-    clock_status("[%d/6] connectedScenes=0x%llx scene=0x%llx", step, scenes, scene);
+    ov_status("[%d/6] connectedScenes=0x%llx scene=0x%llx", step, scenes, scene);
     if (!r_is_objc_ptr(scene)) return false;
 
     /* 4/6 — our own high-level window. Screen geometry is local (see header). */
@@ -179,70 +363,55 @@ static bool clock_build(RemoteCall *proc)
         : 0;
     if (!r_is_objc_ptr(window)) {
         step++;
-        clock_status("[%d/6] 窗口创建失败 allocated=0x%llx", step, allocatedWindow);
+        ov_status("[%d/6] 窗口创建失败 allocated=0x%llx", step, allocatedWindow);
         return false;
     }
 
-    double level = CLOCK_WINDOW_LEVEL;
+    double level = OV_WINDOW_LEVEL;
     r_msg2_main_raw(window, "setWindowLevel:", &level, sizeof(level), NULL, 0, NULL, 0, NULL, 0);
     r_msg2_main(window, "setUserInteractionEnabled:", 0, 0, 0, 0);
     r_msg2_main(window, "setOpaque:", 0, 0, 0, 0);
-    uint64_t clear = r_msg2_main(clsColor, "clearColor", 0, 0, 0, 0);
-    if (r_is_objc_ptr(clear)) r_msg2_main(window, "setBackgroundColor:", clear, 0, 0, 0);
+    if (r_is_objc_ptr(clsColor)) {
+        uint64_t clear = r_msg2_main(clsColor, "clearColor", 0, 0, 0, 0);
+        if (r_is_objc_ptr(clear)) r_msg2_main(window, "setBackgroundColor:", clear, 0, 0, 0);
+    }
     r_msg2_main_raw(window, "setFrame:", &screen, sizeof(screen), NULL, 0, NULL, 0, NULL, 0);
     r_msg2_main(window, "setHidden:", 1, 0, 0, 0);
-    step++;
-    clock_status("[%d/6] window=0x%llx screen=%.0fx%.0f level=%.0f", step, window,
-                 screen.size.width, screen.size.height, level);
 
-    /* 5/6 — the pill. */
-    CGRect frame = CGRectMake((screen.size.width - CLOCK_WIDTH) / 2.0, CLOCK_TOP,
-                              CLOCK_WIDTH, CLOCK_HEIGHT);
+    /* 5/6 — content: 第一视角网页优先，失败退回时间胶囊。 */
+    double width = screen.size.width * gOvWidthRatio;
+    if (width < 200.0) width = screen.size.width * OV_WEB_WIDTH_RATIO;
+    if (width > screen.size.width) width = screen.size.width;
+    double height = width * OV_WEB_ASPECT;
+    double maxHeight = screen.size.height * 0.7;
+    if (height > maxHeight) height = maxHeight;
+    CGRect webFrame = CGRectMake((screen.size.width - width) / 2.0, gOvTop, width, height);
+    CGRect pillFrame = CGRectMake((screen.size.width - OV_PILL_WIDTH) / 2.0, gOvTop,
+                                  OV_PILL_WIDTH, OV_PILL_HEIGHT);
 
-    uint64_t allocatedLabel = r_msg2_main(clsLabel, "alloc", 0, 0, 0, 0);
-    uint64_t pill = r_is_objc_ptr(allocatedLabel)
-        ? r_msg2_main(allocatedLabel, "init", 0, 0, 0, 0)
-        : 0;
-    step++;
-    clock_status("[%d/6] label allocated=0x%llx pill=0x%llx", step, allocatedLabel, pill);
-    if (!r_is_objc_ptr(pill)) return false;
-
-    double fontSize = CLOCK_FONT_SIZE;
-    uint64_t font = r_is_objc_ptr(clsFont)
-        ? r_msg2_main_raw(clsFont, "systemFontOfSize:", &fontSize, sizeof(fontSize),
-                          NULL, 0, NULL, 0, NULL, 0)
-        : 0;
-    if (r_is_objc_ptr(font)) r_msg2_main(pill, "setFont:", font, 0, 0, 0);
-    r_msg2_main(pill, "setTextAlignment:", 1 /* centre */, 0, 0, 0);
-    r_msg2_main(pill, "setNumberOfLines:", 1, 0, 0, 0);
-    r_msg2_main(pill, "setClipsToBounds:", 1, 0, 0, 0);
-    uint64_t white = r_msg2_main(clsColor, "whiteColor", 0, 0, 0, 0);
-    uint64_t black = r_msg2_main(clsColor, "blackColor", 0, 0, 0, 0);
-    if (r_is_objc_ptr(white)) r_msg2_main(pill, "setTextColor:", white, 0, 0, 0);
-    if (r_is_objc_ptr(black)) r_msg2_main(pill, "setBackgroundColor:", black, 0, 0, 0);
-    uint64_t layer = r_msg2_main(pill, "layer", 0, 0, 0, 0);
-    if (r_is_objc_ptr(layer)) {
-        double radius = CLOCK_CORNER_RADIUS;
-        r_msg2_main_raw(layer, "setCornerRadius:", &radius, sizeof(radius), NULL, 0, NULL, 0, NULL, 0);
+    uint64_t content = ov_build_web(proc, screen, webFrame);
+    if (!r_is_objc_ptr(content)) {
+        content = ov_build_pill(screen, pillFrame);
     }
-    r_msg2_main_raw(pill, "setFrame:", &frame, sizeof(frame), NULL, 0, NULL, 0, NULL, 0);
-    r_msg2_main(pill, "setTag:", (uint64_t)CLOCK_TAG, 0, 0, 0);
-
-    /* 6/6 — first text, attach, show, verify. */
-    gClockPill = pill;
-    clock_push_text();
-    r_msg2_main(window, "addSubview:", pill, 0, 0, 0);
-    r_msg2_main(window, "setHidden:", 0, 0, 0, 0);
-
-    uint64_t found = r_msg2_main(window, "viewWithTag:", (uint64_t)CLOCK_TAG, 0, 0, 0);
-    uint64_t hidden = r_msg2_main(pill, "isHidden", 0, 0, 0, 0);
     step++;
-    clock_status("[%d/6] 校验 tag=0x%llx(应为0x%llx) hidden=%llu frame=%.0f,%.0f", step, found, pill,
-                 (unsigned long long)(hidden & 0xff), frame.origin.x, frame.origin.y);
+    ov_status("[%d/6] content=0x%llx web=%d frame=%.0f,%.0f %.0fx%.0f url=%s",
+              step, content, gOvWebMode ? 1 : 0,
+              webFrame.origin.x, webFrame.origin.y, webFrame.size.width, webFrame.size.height, gOvUrl);
+    if (!r_is_objc_ptr(content)) return false;
 
-    gClockWindow = window;
-    gClockPid = proc.pid;
-    return r_is_objc_ptr(found) && found == pill;
+    /* 6/6 — attach, show, verify. */
+    r_msg2_main(window, "addSubview:", content, 0, 0, 0);
+    r_msg2_main(window, "setHidden:", 0, 0, 0, 0);
+    r_msg2_main(content, "setHidden:", 0, 0, 0, 0);
+
+    uint64_t found = r_msg2_main(window, "viewWithTag:", (uint64_t)OV_TAG, 0, 0, 0);
+    step++;
+    ov_status("[%d/6] 校验 tag=0x%llx(应为0x%llx) 内容=%s",
+              step, found, content, gOvWebMode ? "第一视角" : "时间胶囊");
+
+    gOvWindow = window;
+    gOvPid = proc.pid;
+    return r_is_objc_ptr(found) && found == content;
 }
 
 #pragma mark - Public API
@@ -250,75 +419,83 @@ static bool clock_build(RemoteCall *proc)
 bool clock_overlay_start(RemoteCall *proc)
 {
     if (!proc) {
-        clock_status("RemoteCall 为空：请先在首页初始化远程调用");
+        ov_status("RemoteCall 为空：请先在首页初始化远程调用");
         return false;
     }
 
-    pthread_mutex_lock(&gClockLock);
+    pthread_mutex_lock(&gOvLock);
 
-    if (gClockRunning) {
-        pthread_mutex_unlock(&gClockLock);
+    if (gOvRunning) {
+        pthread_mutex_unlock(&gOvLock);
         return true;
     }
 
     /* Still alive in the same target? Just show it again. */
-    if (gClockPid == proc.pid && r_is_objc_ptr(gClockPill) && r_is_objc_ptr(gClockWindow)) {
-        uint64_t found = r_msg2_main(gClockWindow, "viewWithTag:", (uint64_t)CLOCK_TAG, 0, 0, 0);
-        if (found == gClockPill) {
-            r_msg2_main(gClockWindow, "setHidden:", 0, 0, 0, 0);
-            r_msg2_main(gClockPill, "setHidden:", 0, 0, 0, 0);
-            gClockLastText[0] = '\0';
-            clock_push_text();
-            gClockRunning = true;
-            clock_start_timer(proc);
-            clock_status("复用已有胶囊：window=0x%llx pill=0x%llx", gClockWindow, gClockPill);
-            pthread_mutex_unlock(&gClockLock);
+    uint64_t existing = r_is_objc_ptr(gOvWeb) ? gOvWeb : gOvPill;
+    if (gOvPid == proc.pid && r_is_objc_ptr(existing) && r_is_objc_ptr(gOvWindow)) {
+        uint64_t found = r_msg2_main(gOvWindow, "viewWithTag:", (uint64_t)OV_TAG, 0, 0, 0);
+        if (found == existing) {
+            r_msg2_main(gOvWindow, "setHidden:", 0, 0, 0, 0);
+            r_msg2_main(existing, "setHidden:", 0, 0, 0, 0);
+            gOvRunning = true;
+            if (gOvWebMode && strncmp(gOvUrl, gOvUrlLoaded, sizeof(gOvUrl)) != 0) ov_load_url();
+            if (!gOvWebMode) { gOvLastText[0] = '\0'; ov_push_text(); }
+            ov_start_timer(proc);
+            ov_status("复用已有浮层：window=0x%llx content=0x%llx(%s)",
+                      gOvWindow, existing, gOvWebMode ? "第一视角" : "时间胶囊");
+            pthread_mutex_unlock(&gOvLock);
             return true;
         }
     }
 
-    gClockWindow = 0;
-    gClockPill = 0;
-    gClockLastText[0] = '\0';
+    gOvWindow = 0;
+    gOvPill = 0;
+    gOvWeb = 0;
+    gOvLastText[0] = '\0';
+    gOvUrlLoaded[0] = '\0';
 
-    bool attached = clock_build(proc);
+    bool attached = ov_build(proc);
     if (!attached) {
-        /* clock_build printed the last step it reached. */
-        pthread_mutex_unlock(&gClockLock);
+        /* ov_build printed the last step it reached. */
+        pthread_mutex_unlock(&gOvLock);
         return false;
     }
 
-    gClockRunning = true;
-    clock_start_timer(proc);
-    clock_status("已显示：window=0x%llx pill=0x%llx", gClockWindow, gClockPill);
+    gOvRunning = true;
+    ov_start_timer(proc);
+    ov_status("已显示：%s window=0x%llx content=0x%llx url=%s",
+              gOvWebMode ? "第一视角" : "时间胶囊", gOvWindow,
+              gOvWebMode ? gOvWeb : gOvPill, gOvUrl);
 
-    pthread_mutex_unlock(&gClockLock);
+    pthread_mutex_unlock(&gOvLock);
     return true;
 }
 
 bool clock_overlay_selftest(RemoteCall *proc)
 {
     if (!proc) {
-        clock_status("自检失败：RemoteCall 为空");
+        ov_status("自检失败：RemoteCall 为空");
         return false;
     }
 
     /* Clean slate, so the numbered steps below tell the whole story. */
-    pthread_mutex_lock(&gClockLock);
-    gClockRunning = false;
-    if (gClockTimer) {
-        dispatch_source_cancel(gClockTimer);
-        gClockTimer = nil;
+    pthread_mutex_lock(&gOvLock);
+    gOvRunning = false;
+    if (gOvTimer) {
+        dispatch_source_cancel(gOvTimer);
+        gOvTimer = nil;
     }
-    if (r_is_objc_ptr(gClockPill)) {
-        r_msg2_main(gClockPill, "setHidden:", 1, 0, 0, 0);
-    }
-    gClockWindow = 0;
-    gClockPill = 0;
-    gClockLastText[0] = '\0';
-    pthread_mutex_unlock(&gClockLock);
+    if (r_is_objc_ptr(gOvWeb)) r_msg2_main(gOvWeb, "setHidden:", 1, 0, 0, 0);
+    if (r_is_objc_ptr(gOvPill)) r_msg2_main(gOvPill, "setHidden:", 1, 0, 0, 0);
+    gOvWindow = 0;
+    gOvPill = 0;
+    gOvWeb = 0;
+    gOvWebMode = false;
+    gOvLastText[0] = '\0';
+    gOvUrlLoaded[0] = '\0';
+    pthread_mutex_unlock(&gOvLock);
 
-    printf("(clock) === 自检开始 ===\n");
+    printf("(overlay) === 自检开始 ===\n");
     fflush(stdout);
     return clock_overlay_start(proc);
 }
@@ -327,36 +504,33 @@ void clock_overlay_stop(RemoteCall *proc)
 {
     (void)proc;
 
-    pthread_mutex_lock(&gClockLock);
+    pthread_mutex_lock(&gOvLock);
 
-    gClockRunning = false;
-    if (gClockTimer) {
-        dispatch_source_cancel(gClockTimer);
-        gClockTimer = nil;
+    gOvRunning = false;
+    if (gOvTimer) {
+        dispatch_source_cancel(gOvTimer);
+        gOvTimer = nil;
     }
 
-    if (r_is_objc_ptr(gClockPill)) {
-        r_msg2_main(gClockPill, "setHidden:", 1, 0, 0, 0);
-    }
-    if (r_is_objc_ptr(gClockWindow)) {
-        r_msg2_main(gClockWindow, "setHidden:", 1, 0, 0, 0);
-    }
-    gClockLastText[0] = '\0';
-    clock_status("已隐藏（对象保留，可直接再次开启）");
+    if (r_is_objc_ptr(gOvWeb)) r_msg2_main(gOvWeb, "setHidden:", 1, 0, 0, 0);
+    if (r_is_objc_ptr(gOvPill)) r_msg2_main(gOvPill, "setHidden:", 1, 0, 0, 0);
+    if (r_is_objc_ptr(gOvWindow)) r_msg2_main(gOvWindow, "setHidden:", 1, 0, 0, 0);
+    gOvLastText[0] = '\0';
+    ov_status("已隐藏（对象保留，可直接再次开启）");
 
-    pthread_mutex_unlock(&gClockLock);
+    pthread_mutex_unlock(&gOvLock);
 }
 
 bool clock_overlay_is_running(void)
 {
     /* Status flag only: read without the lock so a slow tick can never block
        the caller (a stale read here is harmless). */
-    return gClockRunning;
+    return gOvRunning;
 }
 
 const char *clock_overlay_status(void)
 {
-    return gClockStatus;
+    return gOvStatus;
 }
 
 void clock_overlay_unbind(void)

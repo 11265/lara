@@ -4,7 +4,7 @@
 //
 //  Created by ruter on 23.03.26.
 //
-//  精简版：Tweaks 与文件管理器已移除，只保留漏洞利用、远程调用与全局悬浮时间。
+//  精简版：Tweaks 与文件管理器已移除，只保留漏洞利用、远程调用与全局悬浮·第一视角。
 //
 
 import SwiftUI
@@ -100,7 +100,7 @@ struct lara: App {
 
         case .active:
             globallogger.capture()
-            // 回到前台：确保悬浮时间还在
+            // 回到前台：确保悬浮第一视角还在
             if mgr.rcready && !mgr.clockrunning {
                 mgr.startClock()
             }
@@ -113,9 +113,9 @@ struct lara: App {
     private func handlebg() {
         guard mgr.rcready else { return }
 
-        // 悬浮时间由 lara 进程驱动，切到后台时不能销毁远程调用
+        // 悬浮第一视角由 lara 进程驱动，切到后台时不能销毁远程调用
         if mgr.clockrunning {
-            globallogger.log("(clock) 后台保留远程调用以维持悬浮时间")
+            globallogger.log("(fpv) 后台保留远程调用以维持悬浮第一视角")
             return
         }
 
