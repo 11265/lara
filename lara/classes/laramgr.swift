@@ -697,6 +697,31 @@ final class laramgr: ObservableObject {
     /// 第一视角页面的局域网地址（电脑上跑 rr/fpv 的 server.py）。
     static let fpvDefaultURL = "http://192.168.137.1:18099/"
 
+    private var orientationObserver: NSObjectProtocol?
+
+    /// 把「设备方向 + 是否全屏」推给浮层。浮层按本机真实分辨率自己重排 frame：
+    /// 横屏 = 长短边对调铺开，全屏 = 铺满整屏；不会重建浮层、不会重新加载页面。
+    func pushLayout() {
+        UIDevice.current.beginGeneratingDeviceOrientationNotifications()
+        if orientationObserver == nil {
+            orientationObserver = NotificationCenter.default.addObserver(
+                forName: UIDevice.orientationDidChangeNotification,
+                object: nil, queue: .main
+            ) { [weak self] _ in
+                self?.pushLayout()
+            }
+        }
+        let o = UIDevice.current.orientation
+        // 设备方向（不受 lara 自身是否锁定竖屏影响）；未知时沿用上次判断
+        if o.isLandscape || o.isPortrait {
+            lastLandscape = o.isLandscape
+        }
+        let full = UserDefaults.standard.bool(forKey: "fpvFullscreen")
+        clock_overlay_set_layout(lastLandscape ? 1 : 0, full ? 1 : 0)
+    }
+
+    private var lastLandscape = false
+
     func startClock() {
         guard dsready, let sbProc, !clockrunning, !clockstarting else { return }
         // 上次把远程会话弄坏后就上锁：不再自动重试，避免反复冲击参数缓冲区把 SpringBoard 打崩
@@ -717,7 +742,8 @@ final class laramgr: ObservableObject {
         let top = UserDefaults.standard.object(forKey: "fpvTop") as? Double ?? 56.0
         url.withCString { clock_overlay_set_url($0) }
         clock_overlay_set_geometry(ratio, top)
-        logmsg("(fpv) 开始加载第一视角：\(url)（宽 \(Int(ratio * 100))%）")
+        pushLayout()                       // 方向 + 全屏 + 分辨率
+        logmsg("(fpv) 开始加载第一视角：\(url)（宽 \(Int(ratio * 100))%，\(lastLandscape ? "横屏" : "竖屏")\(UserDefaults.standard.bool(forKey: "fpvFullscreen") ? " 全屏" : "")）")
         clockstarting = true
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let ok = clock_overlay_start(sbProc)

@@ -30,6 +30,12 @@ void clock_overlay_set_url(const char *url);
 /// topMargin 为距屏幕顶部点数（<=0 用默认值）。高度按 16:9 计算。
 void clock_overlay_set_geometry(double widthRatio, double topMargin);
 
+/// 屏幕方向与全屏：
+///   landscape  = 1 表示设备当前是横屏（浮层按设备长短边对调后铺开）；
+///   fullscreen = 1 表示页面铺满整屏（否则按 widthRatio 的 16:9 面板）。
+/// 尺寸一律按本机真实分辨率算，并在值变化时只重设 frame（不重建、不重新加载页面）。
+void clock_overlay_set_layout(int landscape, int fullscreen);
+
 /// 当前浮层内容的地址（只读，永不返回 NULL）。
 const char *clock_overlay_url(void);
 

@@ -17,6 +17,7 @@ struct ClockView: View {
     @AppStorage("fpvURL") private var fpvURL: String = laramgr.fpvDefaultURL
     @AppStorage("fpvWidth") private var fpvWidth: Double = 0.92
     @AppStorage("fpvTop") private var fpvTop: Double = 56
+    @AppStorage("fpvFullscreen") private var fpvFullscreen: Bool = false
 
     @State private var probe = ""
     @State private var probing = false
@@ -79,16 +80,32 @@ struct ClockView: View {
             }
 
             Section {
+                Toggle(isOn: Binding(
+                    get: { fpvFullscreen },
+                    set: { on in
+                        fpvFullscreen = on
+                        mgr.pushLayout()          // 立刻重排：铺满整屏 / 回到面板
+                    }
+                )) {
+                    Text("铺满整屏（全屏）")
+                }
                 HStack {
                     Text("宽度")
-                    Slider(value: $fpvWidth, in: 0.3...1.0, step: 0.02)
+                    Slider(value: Binding(
+                        get: { fpvWidth },
+                        set: { fpvWidth = $0; mgr.pushLayout() }
+                    ), in: 0.3...1.0, step: 0.02)
                     Text("\(Int(fpvWidth * 100))%")
                         .font(.system(.caption, design: .monospaced))
                         .frame(width: 46, alignment: .trailing)
                 }
+                .disabled(fpvFullscreen)
                 HStack {
                     Text("顶部距离")
-                    Slider(value: $fpvTop, in: 0...400, step: 4)
+                    Slider(value: Binding(
+                        get: { fpvTop },
+                        set: { fpvTop = $0; mgr.pushLayout() }
+                    ), in: 0...400, step: 4)
                     Text("\(Int(fpvTop))pt")
                         .font(.system(.caption, design: .monospaced))
                         .frame(width: 46, alignment: .trailing)
@@ -98,9 +115,9 @@ struct ClockView: View {
                 }
                 .disabled(!mgr.rcready)
             } header: {
-                Text("尺寸")
+                Text("尺寸 · 方向")
             } footer: {
-                Text("高度按 16:9 自动算。悬浮层不吃触摸，页面上的按钮按不到；准星/距离/FOV 想调就改地址后面的参数，例如 ?fov=100&eye=1.6&dist=0。")
+                Text("尺寸按本机真实分辨率算：面板模式高宽比 16:9，全屏模式铺满整屏（顶部距离仍生效）。横屏时浮层自动按设备方向旋转铺开——把手机横过来即可，页面不会重新加载。")
             }
 
             if !mgr.clockstatus.isEmpty {

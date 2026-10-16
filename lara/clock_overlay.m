@@ -84,6 +84,16 @@ static unsigned gOvTick = 0;
 static bool gOvBuilding = false;
 static bool gOvFailed = false;
 
+/* 方向 / 全屏：由 lara 主线程用设备方向推过来（见 clock_overlay_set_layout）。
+   目标进程的窗口空间跟随设备方向，所以横屏 = 长短边对调；尺寸全部按本机真实
+   分辨率算，方向变化时只重设 frame，不重建浮层、不重新加载页面。 */
+static int gOvLandscape = 0;
+static int gOvFullscreen = 0;
+static int gOvAppliedLandscape = -1;
+static int gOvAppliedFullscreen = -1;
+static double gOvAppliedW = 0;
+static double gOvAppliedH = 0;
+
 static void ov_status(const char *fmt, ...)
 {
     va_list ap;
@@ -111,6 +121,75 @@ void clock_overlay_set_geometry(double widthRatio, double topMargin)
 {
     gOvWidthRatio = (widthRatio >= 0.2 && widthRatio <= 1.0) ? widthRatio : OV_WEB_WIDTH_RATIO;
     gOvTop = (topMargin >= 0.0 && topMargin <= 600.0) ? topMargin : OV_WEB_TOP;
+}
+
+void clock_overlay_set_layout(int landscape, int fullscreen)
+{
+    gOvLandscape = landscape ? 1 : 0;
+    gOvFullscreen = fullscreen ? 1 : 0;
+}
+
+/* 本机真实分辨率的“长边/短边”。本地读取：远程读 bounds 会把目标卡死。 */
+static void ov_screen_sides(double *longSide, double *shortSide)
+{
+    CGRect b = [UIScreen mainScreen].bounds;
+    double w = b.size.width, h = b.size.height;
+    if (w < 1.0 || h < 1.0) { w = 390.0; h = 844.0; }
+    *longSide = (w > h) ? w : h;
+    *shortSide = (w > h) ? h : w;
+}
+
+/* 当前内容（网页或胶囊）应该占的 frame：横屏把长短边对调，全屏铺满整屏。 */
+static CGRect ov_content_frame(void)
+{
+    double L = 0, S = 0;
+    ov_screen_sides(&L, &S);
+    double W = gOvLandscape ? L : S;          /* 目标进程的窗口空间跟随设备方向 */
+    double H = gOvLandscape ? S : L;
+
+    if (!gOvWebMode) {                        /* 退回方案：时间胶囊，居中靠顶 */
+        return CGRectMake((W - OV_PILL_WIDTH) / 2.0, gOvTop, OV_PILL_WIDTH, OV_PILL_HEIGHT);
+    }
+
+    if (gOvFullscreen) {
+        double top = gOvTop;
+        if (top < 0.0 || top > H - 120.0) top = 0.0;
+        return CGRectMake(0, top, W, H - top);
+    }
+
+    double width = W * gOvWidthRatio;
+    if (width < 200.0) width = W * OV_WEB_WIDTH_RATIO;
+    if (width > W) width = W;
+    double height = width * OV_WEB_ASPECT;
+    double maxHeight = H - gOvTop - 20.0;
+    if (height > maxHeight) height = maxHeight;
+    if (height < 120.0) height = 120.0;
+    return CGRectMake((W - width) / 2.0, gOvTop, width, height);
+}
+
+/* 把方向/全屏/尺寸变化应用到目标（只改 frame，页面不动）。 */
+static void ov_apply_layout(void)
+{
+    if (!r_is_objc_ptr(gOvWindow)) return;
+    double L = 0, S = 0;
+    ov_screen_sides(&L, &S);
+    double W = gOvLandscape ? L : S;
+    double H = gOvLandscape ? S : L;
+
+    CGRect win = CGRectMake(0, 0, W, H);
+    CGRect content = ov_content_frame();
+    r_msg2_main_raw(gOvWindow, "setFrame:", &win, sizeof(win), NULL, 0, NULL, 0, NULL, 0);
+    uint64_t target = gOvWebMode ? gOvWeb : gOvPill;
+    if (r_is_objc_ptr(target)) {
+        r_msg2_main_raw(target, "setFrame:", &content, sizeof(content), NULL, 0, NULL, 0, NULL, 0);
+    }
+    gOvAppliedLandscape = gOvLandscape;
+    gOvAppliedFullscreen = gOvFullscreen;
+    gOvAppliedW = W;
+    gOvAppliedH = H;
+    ov_status("布局已更新：%s%s %.0fx%.0f → 内容 %.0f,%.0f %.0fx%.0f",
+              gOvLandscape ? "横屏" : "竖屏", gOvFullscreen ? " 全屏" : "",
+              W, H, content.origin.x, content.origin.y, content.size.width, content.size.height);
 }
 
 const char *clock_overlay_url(void)
@@ -301,6 +380,16 @@ static void ov_tick(void)
     } else {
         ov_push_text();
     }
+
+    /* 方向（横竖屏）、全屏开关、分辨率变化：只重设 frame，页面不重建。 */
+    double L = 0, S = 0;
+    ov_screen_sides(&L, &S);
+    double W = gOvLandscape ? L : S;
+    double H = gOvLandscape ? S : L;
+    if (gOvAppliedLandscape != gOvLandscape || gOvAppliedFullscreen != gOvFullscreen
+        || gOvAppliedW != W || gOvAppliedH != H) {
+        ov_apply_layout();
+    }
     pthread_mutex_unlock(&gOvLock);
 }
 
@@ -435,16 +524,12 @@ static bool ov_build(RemoteCall *proc)
     r_msg2_main_raw(window, "setFrame:", &screen, sizeof(screen), NULL, 0, NULL, 0, NULL, 0);
     r_msg2_main(window, "setHidden:", 1, 0, 0, 0);
 
-    /* 5/6 — content: 第一视角网页优先，失败退回时间胶囊。 */
-    double width = screen.size.width * gOvWidthRatio;
-    if (width < 200.0) width = screen.size.width * OV_WEB_WIDTH_RATIO;
-    if (width > screen.size.width) width = screen.size.width;
-    double height = width * OV_WEB_ASPECT;
-    double maxHeight = screen.size.height * 0.7;
-    if (height > maxHeight) height = maxHeight;
-    CGRect webFrame = CGRectMake((screen.size.width - width) / 2.0, gOvTop, width, height);
-    CGRect pillFrame = CGRectMake((screen.size.width - OV_PILL_WIDTH) / 2.0, gOvTop,
-                                  OV_PILL_WIDTH, OV_PILL_HEIGHT);
+    /* 5/6 — content: 第一视角网页优先，失败退回时间胶囊。
+       frame 按当前方向/全屏/真实分辨率算（见 ov_content_frame）。 */
+    gOvWebMode = true;
+    CGRect webFrame = ov_content_frame();
+    gOvWebMode = false;
+    CGRect pillFrame = ov_content_frame();
 
     uint64_t content = ov_build_web(proc, screen, webFrame);
     if (!r_is_objc_ptr(content)) {
@@ -468,6 +553,9 @@ static bool ov_build(RemoteCall *proc)
 
     gOvWindow = window;
     gOvPid = proc.pid;
+    /* 记录当前布局，之后方向/全屏变化时 tick 会自己重排 */
+    gOvAppliedLandscape = -1;
+    ov_apply_layout();
     return r_is_objc_ptr(found) && found == content;
 }
 
