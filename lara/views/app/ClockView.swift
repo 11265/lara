@@ -34,14 +34,14 @@ struct ClockView: View {
                     .font(.footnote)
                     .foregroundColor(.secondary)
 
-                Button("诊断") {
+                Button("重新自检并显示") {
                     mgr.diagnoseClock()
                 }
                 .disabled(!mgr.rcready)
             } header: {
                 Text("悬浮时钟")
             } footer: {
-                Text("时间胶囊画在 SpringBoard 上，会浮在应用之上；退出 lara 后停止。")
+                Text("时间胶囊画在 SpringBoard 上，会浮在应用之上；退出 lara 后停止。自检会把 [1/8]…[8/8] 每一步写进日志，哪一步失败日志就停在哪一步。")
             }
 
             if !mgr.clockstatus.isEmpty {

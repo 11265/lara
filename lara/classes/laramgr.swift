@@ -731,8 +731,22 @@ final class laramgr: ObservableObject {
         }
     }
 
-    /// Refreshes the diagnostic line shown in Tools, without touching the overlay.
+    /// 强制重建悬浮窗并逐步骤写日志（Tools/时钟页的「自检」按钮）。
     func diagnoseClock() {
-        clockstatus = String(cString: clock_overlay_status())
+        guard dsready, let sbProc else {
+            clockstatus = "远程调用未就绪"
+            return
+        }
+        clockstatus = "自检运行中…"
+        logmsg("(clock) 自检开始…")
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let ok = clock_overlay_selftest(sbProc)
+            let status = String(cString: clock_overlay_status())
+            DispatchQueue.main.async {
+                self?.clockrunning = ok && clock_overlay_is_running()
+                self?.clockstatus = status
+                self?.logmsg("(clock) 自检\(ok ? "成功" : "失败")：\(status)")
+            }
+        }
     }
 }
