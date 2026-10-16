@@ -81,6 +81,7 @@ final class laramgr: ObservableObject {
     @Published var showrespring: Bool = false
     @Published var showLogs: Bool = false
     @Published var clockrunning: Bool = false
+    @Published var clockstatus: String = ""
 
     var sbProc: RemoteCall?
     var ytProc = RemoteCall(process: "youtube", useMigFilterBypass: false)
@@ -632,6 +633,9 @@ final class laramgr: ObservableObject {
                 clock_overlay_stop(sbProc)
             }
             self?.sbProc?.destroy()
+            // remote_objc's global helpers still point at the session we just
+            // destroyed, so drop that binding as well.
+            clock_overlay_unbind()
             DispatchQueue.main.async {
                 self?.logmsg("remote call session destroyed")
                 completion?()
@@ -692,9 +696,11 @@ final class laramgr: ObservableObject {
         logmsg("(clock) starting floating clock...")
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let ok = clock_overlay_start(sbProc)
+            let status = String(cString: clock_overlay_status())
             DispatchQueue.main.async {
                 self?.clockrunning = ok
-                self?.logmsg(ok ? "(clock) floating clock running" : "(clock) overlay creation failed")
+                self?.clockstatus = status
+                self?.logmsg(ok ? "(clock) \(status)" : "(clock) 失败：\(status)")
             }
         }
     }
@@ -708,10 +714,17 @@ final class laramgr: ObservableObject {
         logmsg("(clock) stopping floating clock...")
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             clock_overlay_stop(sbProc)
+            let status = String(cString: clock_overlay_status())
             DispatchQueue.main.async {
                 self?.clockrunning = false
-                self?.logmsg("(clock) floating clock hidden")
+                self?.clockstatus = status
+                self?.logmsg("(clock) \(status)")
             }
         }
+    }
+
+    /// Refreshes the diagnostic line shown in Tools, without touching the overlay.
+    func diagnoseClock() {
+        clockstatus = String(cString: clock_overlay_status())
     }
 }

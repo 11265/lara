@@ -196,11 +196,11 @@ struct ContentView: View {
                     Button("初始化远程调用", action: {
                         mgr.rcinit(process: "SpringBoard", migbypass: false) { success in
                             if success {
-                                mgr.logmsg("rc init succeeded!")
+                                mgr.logmsg("远程调用初始化成功！")
                                 let pid = mgr.rccall(name: "getpid")
-                                mgr.logmsg("remote getpid() returned: \(pid)")
+                                mgr.logmsg("远程 getpid() 返回：\(pid)")
                             } else {
-                                mgr.logmsg("rc init failed")
+                                mgr.logmsg("远程调用初始化失败")
                                 mgr.rcfailed = true
                             }
                         }

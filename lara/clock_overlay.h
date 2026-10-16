@@ -21,7 +21,7 @@
 
 /// Creates (or re-shows) the floating clock in `proc` — expected to be a live
 /// SpringBoard RemoteCall — and starts ticking it once per second.
-/// Returns true when the overlay is up and ticking.
+/// Returns true when the pill was attached and made visible.
 bool clock_overlay_start(RemoteCall *proc);
 
 /// Stops ticking and hides the overlay. The pill is hidden, not destroyed, so
@@ -31,6 +31,15 @@ void clock_overlay_stop(RemoteCall *proc);
 
 /// True while the clock is ticking.
 bool clock_overlay_is_running(void);
+
+/// Human readable one-line state of the last start attempt (never NULL):
+/// plan/scene/window/label/level/hidden/text/screen. Meant to be shown to the
+/// user so a failed overlay can be diagnosed without a debugger.
+const char *clock_overlay_status(void);
+
+/// Drops the binding to the RemoteCall session (call it when lara destroys the
+/// remote call, so a later start cannot use a destroyed session).
+void clock_overlay_unbind(void);
 
 #endif /* __OBJC__ */
 
