@@ -95,7 +95,7 @@ static void ov_build_slots_step(void);
 
 /* 每格的上一次下发值：只有真的变了才发远程调用。
    远程调用很贵（每次还打印十几行调试），静止画面下应该几乎不发。 */
-typedef struct { bool used; bool hidden; OV_Rect r; int dist; } OV_SlotCache;
+typedef struct { bool used; bool hidden; bool distHidden; OV_Rect r; int dist; } OV_SlotCache;
 static OV_SlotCache gOvCache[OV_MAX_SLOTS];
 static bool gOvCacheValid = false;
 
@@ -674,29 +674,35 @@ static int ov_draw_snapshot(void)
         int distM = (int)(depth + 0.5);
 
         OV_SlotCache *c = &gOvCache[i];
-        bool need = !gOvCacheValid || c->hidden || !c->used
-                    || fabs(c->r.x - box.x) > 0.5 || fabs(c->r.y - box.y) > 0.5
-                    || fabs(c->r.w - box.w) > 0.5 || fabs(c->r.h - box.h) > 0.5
-                    || c->dist != distM;
-        if (need) {
-            if (!gOvCacheValid || c->hidden || !c->used || fabs(c->r.x - box.x) > 0.5
-                || fabs(c->r.y - box.y) > 0.5 || fabs(c->r.w - box.w) > 0.5
-                || fabs(c->r.h - box.h) > 0.5) {
-                ov_set_rect(gOvBox[i], "setFrame:", box);
-                ov_set_bool(gOvBox[i], "setHidden:", 0);
-                if (r_is_objc_ptr(gOvDist[i])) {
-                    OV_Rect dl = {cx - ox - 40.0, cy - oy + boxH / 2.0 + 2.0, 80.0, 14.0};
-                    ov_set_rect(gOvDist[i], "setFrame:", dl);
-                    ov_set_bool(gOvDist[i], "setHidden:", gOvShowDist ? 0 : 1);
+        /* 每格的上一次下发值：只有真的变了才发远程调用。远程调用极贵——标量 setter
+           在非 vphone 通道下走 NSInvocation，每次 13 个远程调用、每个调用还会 spawn
+           一个 pac 线程 + 异常端口。所以能省则省：
+             - 位置没变就不发 setFrame:；
+             - 已经可见就不再发 setHidden:0（重复发等于白跑 13 次远程调用）。 */
+        bool geomChanged = !gOvCacheValid || !c->used
+                           || fabs(c->r.x - box.x) > 0.5 || fabs(c->r.y - box.y) > 0.5
+                           || fabs(c->r.w - box.w) > 0.5 || fabs(c->r.h - box.h) > 0.5;
+        bool needShow = !gOvCacheValid || c->hidden || !c->used;
+        if (geomChanged) {
+            ov_set_rect(gOvBox[i], "setFrame:", box);
+            if (needShow) ov_set_bool(gOvBox[i], "setHidden:", 0);
+            if (r_is_objc_ptr(gOvDist[i])) {
+                OV_Rect dl = {cx - ox - 40.0, cy - oy + boxH / 2.0 + 2.0, 80.0, 14.0};
+                ov_set_rect(gOvDist[i], "setFrame:", dl);
+                bool wantDistHidden = gOvShowDist ? false : true;
+                bool distChangedVis = !gOvCacheValid || c->distHidden || !c->used;
+                if (distChangedVis || c->distHidden != wantDistHidden) {
+                    ov_set_bool(gOvDist[i], "setHidden:", wantDistHidden ? 1 : 0);
+                    c->distHidden = wantDistHidden;
                 }
             }
-            if (!gOvCacheValid || c->dist != distM) {
-                char buf[OV_NAME_TEXT_MAX];
-                snprintf(buf, sizeof(buf), "%dm", distM);
-                ov_set_text(gOvDist[i], buf);
-            }
-            c->used = true; c->hidden = false; c->r = box; c->dist = distM;
         }
+        if (!gOvCacheValid || c->dist != distM) {
+            char buf[OV_NAME_TEXT_MAX];
+            snprintf(buf, sizeof(buf), "%dm", distM);
+            ov_set_text(gOvDist[i], buf);
+        }
+        c->used = true; c->hidden = false; c->r = box; c->dist = distM;
     }
 
     for (int i = drawn; i < gOvSlotsAllocated; i++) {
@@ -704,7 +710,7 @@ static int ov_draw_snapshot(void)
         if (gOvCacheValid && (c->hidden || !c->used)) continue;
         if (r_is_objc_ptr(gOvBox[i])) ov_set_bool(gOvBox[i], "setHidden:", 1);
         if (r_is_objc_ptr(gOvDist[i])) ov_set_bool(gOvDist[i], "setHidden:", 1);
-        c->hidden = true; c->used = false;
+        c->hidden = true; c->used = false; c->distHidden = true;
     }
     gOvCacheValid = true;
     return drawn;
