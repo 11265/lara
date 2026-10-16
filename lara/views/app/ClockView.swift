@@ -20,7 +20,7 @@ struct ClockView: View {
     @AppStorage("fpvFullscreen") private var fpvFullscreen: Bool = false
     @AppStorage("fpvHeight") private var fpvHeight: Double = 0
     @AppStorage("fpvOrient") private var fpvOrient: String = "landscape"     // landscape（默认）/ portrait
-    @AppStorage("fpvSlots") private var fpvSlots: Int = 8                     // 方框数量（少一点更稳，便于二分定位崩溃）
+    @AppStorage("fpvSlots") private var fpvSlots: Int = 4                     // 方框数量（少一点更稳，便于二分定位崩溃）
     @AppStorage("fpvFov") private var fpvFov: Double = 90
     @AppStorage("fpvEye") private var fpvEye: Double = 1.6
     @AppStorage("fpvTau") private var fpvTau: Double = 70
@@ -104,8 +104,8 @@ struct ClockView: View {
                     get: { fpvSlots },
                     set: { fpvSlots = $0; mgr.pushOverlayConfig() }
                 )) {
-                    Text("4（最稳）").tag(4)
-                    Text("8（默认）").tag(8)
+                    Text("4（默认·最稳）").tag(4)
+                    Text("8").tag(8)
                     Text("16").tag(16)
                     Text("24").tag(24)
                 }

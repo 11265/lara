@@ -757,7 +757,7 @@ final class laramgr: ObservableObject {
         let dist = d.object(forKey: "fpvDist") != nil ? d.bool(forKey: "fpvDist") : true
         let cross = d.object(forKey: "fpvCross") != nil ? d.bool(forKey: "fpvCross") : true
         // 方框数量可选：默认 8（比 24 少一半以上远程调用与目标侧对象，先确认能不能稳）
-        let slots = d.object(forKey: "fpvSlots") as? Int ?? 8
+        let slots = d.object(forKey: "fpvSlots") as? Int ?? 4
         clock_overlay_set_view(Int32(slots), fov, eye, 0, dist ? 1 : 0, cross ? 1 : 0)
         pushLayout()
     }
