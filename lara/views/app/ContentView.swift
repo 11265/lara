@@ -45,6 +45,12 @@ struct ContentView: View {
             .sheet(isPresented: $showSettings) {
                 SettingsView()
             }
+            .onAppear {
+                // 远程调用已就绪时自动显示悬浮时间
+                if mgr.rcready && !mgr.clockrunning {
+                    mgr.startClock()
+                }
+            }
         }
     }
 
@@ -199,6 +205,8 @@ struct ContentView: View {
                                 mgr.logmsg("远程调用初始化成功！")
                                 let pid = mgr.rccall(name: "getpid")
                                 mgr.logmsg("远程 getpid() 返回：\(pid)")
+                                // 调通远程调用后直接显示全局悬浮时间
+                                mgr.startClock()
                             } else {
                                 mgr.logmsg("远程调用初始化失败")
                                 mgr.rcfailed = true
@@ -212,6 +220,18 @@ struct ContentView: View {
                     Button("销毁远程调用", action: {
                         mgr.rcdestroy()
                     })
+                }
+
+                LabeledContent("全局悬浮时间") {
+                    Text(mgr.clockrunning ? "已显示" : "未显示")
+                        .foregroundColor(mgr.clockrunning ? .green : .secondary)
+                }
+
+                if !mgr.clockstatus.isEmpty {
+                    Text(mgr.clockstatus)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundColor(.secondary)
+                        .textSelection(.enabled)
                 }
             } header: {
                 HeaderLabel(text: "远程调用", icon: "syringe")

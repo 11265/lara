@@ -24,21 +24,6 @@ enum method: String, CaseIterable {
     }
 }
 
-enum fmAppsDisplayMode: String, CaseIterable {
-    case UUID = "UUID"
-    case bundleID = "Bundle ID"
-    case appName = "App Name"
-
-    /// 仅用于界面显示；rawValue 是 @AppStorage 的持久化值，不能改。
-    var display: String {
-        switch self {
-        case .UUID: return "UUID"
-        case .bundleID: return "Bundle ID"
-        case .appName: return "应用名称"
-        }
-    }
-}
-
 enum logsdisplaymode: String, CaseIterable {
     case tabs = "In Tabs"
     case toolbar = "In Toolbar"
@@ -70,13 +55,7 @@ struct SettingsView: View {
     
     @AppStorage("logsdisplaymode") private var selectedlogdisplaymode: logsdisplaymode = .toolbar
     @AppStorage("loggerNoBS") private var loggerNoBS: Bool = true
-    
-    @AppStorage("showFMInTabs") private var showFMInTabs: Bool = true
-    @AppStorage("selectedFMAppsDisplayMode") private var selectedFMAppsDisplayMode: fmAppsDisplayMode = .appName
-    @AppStorage("fmRecursiveSearch") private var fmRecursiveSearch: Bool = false
-    
-    @AppStorage("rcDockUnlimited") private var rcDockUnlimited: Bool = false
-    
+
     var body: some View {
         NavigationStack {
             List {
@@ -219,17 +198,6 @@ struct SettingsView: View {
                     .pickerStyle(.menu)
                 }
                 
-                Section(header: HeaderLabel(text: "文件管理器", icon: "folder"), footer: Text("显示模式可让你更改应用文件夹在文件管理器中的显示方式。")) {
-                    Picker("显示模式", selection: $selectedFMAppsDisplayMode) {
-                        ForEach(fmAppsDisplayMode.allCases, id: \.self) { mode in
-                            Text(mode.display).tag(mode)
-                        }
-                    }
-                    .pickerStyle(.menu)
-                    Toggle("在文件管理器中递归搜索", isOn: $fmRecursiveSearch)
-                    Toggle("在标签页中显示文件管理器", isOn: $showFMInTabs)
-                }
-                
                 #if !DISABLE_REMOTECALL
                 Section(header: HeaderLabel(text: "远程调用", icon: "syringe")) {
                     Toggle("暂存 KRW 原语", isOn: $stashKRW)
@@ -278,7 +246,6 @@ struct SettingsView: View {
                         }
                         .disabled(!mgr.dsready || mgr.rcrunning || stashingKRWNow)
                     }
-                    Toggle("允许超过 10 个 Dock 图标", isOn: $rcDockUnlimited)
                 }
                 #endif
             }

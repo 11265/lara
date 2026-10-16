@@ -4,12 +4,14 @@
 //
 //  Created by ruter on 23.03.26.
 //
+//  精简版：Tweaks 与文件管理器已移除，只保留漏洞利用、远程调用与全局悬浮时间。
+//
 
 import SwiftUI
 import UniformTypeIdentifiers
 
 enum taboptions {
-    case applying, tweaks, files, logs
+    case applying, clock, logs
 }
 
 let g_isunsupported: Bool = isunsupported()
@@ -18,31 +20,28 @@ var weonadebugbuild_pjbweouttahereexclamationmark: Bool = false
 @main
 struct lara: App {
     @StateObject private var mgr = laramgr.shared
-    @StateObject private var iconthememgr = IconThemeManager.shared
     @Environment(\.scenePhase) var scenephase
-    @AppStorage("selectedMethod") private var selectedMethod: method = .hybrid
     @AppStorage("keepAlive") private var keepalive: Bool = false
-    @AppStorage("showFMInTabs") private var showfmintabs: Bool = true
     @AppStorage("logsdisplaymode") private var logsdisplaymode: logsdisplaymode = .toolbar
     @State private var selectedtab: taboptions = .applying
-    
+
     init() {
         #if DEBUG
         weonadebugbuild_pjbweouttahereexclamationmark = true
         #endif
-        
+
         // fix file picker
         let fixMethod = class_getInstanceMethod(UIDocumentPickerViewController.self, #selector(UIDocumentPickerViewController.fix_init(forOpeningContentTypes:asCopy:)))!
         let origMethod = class_getInstanceMethod(UIDocumentPickerViewController.self, #selector(UIDocumentPickerViewController.init(forOpeningContentTypes:asCopy:)))!
         method_exchangeImplementations(origMethod, fixMethod)
-        
+
         if keepalive {
             toggleka()
         }
-        
+
         globallogger.capture()
     }
-    
+
     var body: some Scene {
         WindowGroup {
             TabView(selection: $selectedtab) {
@@ -51,25 +50,13 @@ struct lara: App {
                         Image(systemName: "wrench.and.screwdriver.fill")
                     }
                     .tag(taboptions.applying)
-                
-                // this has gotta fucking go
-                TweaksView(mgr: mgr)
+
+                ClockView()
                     .tabItem {
-                        Image(systemName: "ant.fill")
+                        Image(systemName: "clock.fill")
                     }
-                    .tag(taboptions.tweaks)
-                
-                
-                // i'm gonna strangle you root (the weight of your actions will crush you)
-                if showfmintabs {
-                    SantanderView(startPath: "/")
-                        .tabItem {
-                            Image(systemName: "folder.fill")
-                        }
-                        .tag(taboptions.files)
-                }
-                
-                // this too
+                    .tag(taboptions.clock)
+
                 if logsdisplaymode == .tabs {
                     LogsView(logger: globallogger)
                         .tabItem {
@@ -92,30 +79,19 @@ struct lara: App {
             )) {
                 LogsView(logger: globallogger)
             }
-            .sheet(isPresented: $iconthememgr.showFixupSheet) {
-                IconThemeFixupView()
-            }
             .onAppear {
                 if !isunsupported() {
                     init_offsets()
                     offsets_init()
-                    iconthememgr.startPendingFixupIfPossible()
-                    // beautiful name root
-                    // thanks
                     mgr.hasOffsets = emergencyfixfunctiontobereplacedlateronquestionmark()
                 } else {
                     Alertinator.shared.alert(title: "此设备不受支持！", body: "非常抱歉，Lara 目前不支持此设备。可能的原因：\n- 你的 iOS 版本不受支持（支持的版本：iOS 16.0 - iOS 18.7.1、iOS 26.0 - iOS 26.0.1）\n- 你的设备具有 MIE（A19+ 或 M5+）\n- 已附加调试器。", actionLabel: "退出应用", action: { exitinator() })
                 }
             }
             .onChange(of: scenephase, perform: handleScenePhase)
-            .onChange(of: mgr.sbxready) { ready in
-                if ready {
-                    iconthememgr.startPendingFixupIfPossible()
-                }
-            }
         }
     }
-    
+
     private func handleScenePhase(_ phase: ScenePhase) {
         switch phase {
         case .inactive, .background:
@@ -124,7 +100,10 @@ struct lara: App {
 
         case .active:
             globallogger.capture()
-            iconthememgr.startPendingFixupIfPossible()
+            // 回到前台：远程调用还在的话，确保悬浮时间继续显示
+            if mgr.rcready && !mgr.clockrunning {
+                mgr.startClock()
+            }
 
         @unknown default:
             break
@@ -133,6 +112,13 @@ struct lara: App {
 
     private func handlebg() {
         guard mgr.rcready else { return }
+
+        // 悬浮时间由 lara 进程驱动，切到后台时不能销毁远程调用
+        if mgr.clockrunning {
+            globallogger.log("(clock) 后台保留远程调用以维持悬浮时间")
+            return
+        }
+
         let keepSpringBoardRemoteCallAlive = UserDefaults.standard.bool(forKey: "keepSpringBoardRemoteCallAliveIOS16")
         if isIOS16() && keepSpringBoardRemoteCallAlive {
             return

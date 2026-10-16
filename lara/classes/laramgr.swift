@@ -575,6 +575,8 @@ final class laramgr: ObservableObject {
                     self.rcLastError = nil
                     self.rcrunning = false
                     self.rcready = true
+                    // 远程调用一就绪就自动显示全局悬浮时间
+                    self.startClock()
                 } else {
                     self.logmsg("remote call init failed on \(process)")
                     let error = RemoteCall.lastInitError()
@@ -693,6 +695,12 @@ final class laramgr: ObservableObject {
 
     func startClock() {
         guard dsready, let sbProc, !clockrunning else { return }
+        // 悬浮时间由 lara 进程驱动，lara 被挂起就会停走：自动打开后台保活
+        if !kaenabled {
+            toggleka()
+            UserDefaults.standard.set(true, forKey: "keepAlive")
+            logmsg("(clock) 已自动开启后台保活")
+        }
         logmsg("(clock) starting floating clock...")
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let ok = clock_overlay_start(sbProc)
