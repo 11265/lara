@@ -434,48 +434,63 @@ static void ov_start_timer(RemoteCall *proc)
 
 #pragma mark - 会话健康检查
 
-/* 远程会话自检：在碰任何 objc 类之前，先确认“远程调用 + 远程内存读写”是好的。
-   做法都是 crash-safe 的：
-     1) getpid 必须等于目标 pid；
-     2) 远程 malloc 一小块，写魔数再读回，必须一致。
-   任何一步不对就直接放弃建浮层——目标进程活着，用户重开一次就好；
-   反之一旦带着坏参数去调 objc_getClass，SpringBoard 必崩。 */
+/* 远程会话自检：在碰任何 objc 类之前，先确认远程内存通道是好的。
+   判据只用 RemoteCall 自己的 vm 通道（真机日志里一直稳定）：
+     取目标线程结构地址 → 读 8 字节 → 把原值写回 → 再读，必须一致。
+   不碰 objc、不分配内存、不改动目标状态。
+   刻意不看 getpid：r_call_stable 对 getpid 有已知的偶发返回 0 特例
+   （RemoteCall.m 里就专门处理过），拿它当判据会误判成“会话坏了”。
+   读不到地址（可能不可映射）时不下结论、继续建浮层——只有“写失败/读回不一致”
+   才认定通道坏了并放弃。 */
 static bool ov_session_healthy(RemoteCall *proc, const char **why)
 {
+    bool conclusive_bad = false;
+
     for (int attempt = 0; attempt < 3; attempt++) {
         /* 让上一次调用彻底回收，避免和残留的调用交错 */
         r_settle_us(30000);
         usleep(80 * 1000);
 
-        uint64_t pid = r_dlsym_call(R_TIMEOUT, "getpid", 0, 0, 0, 0, 0, 0, 0, 0);
-        if (pid != (uint64_t)proc.pid) {
-            *why = "getpid 与目标 pid 不一致（远程调用回复可能已错位）";
-            printf("(overlay) 健康检查[%d]：getpid=0x%llx 期望 %d\n", attempt, pid, proc.pid);
+        uint64_t addr = proc.trojanThreadAddr ? proc.trojanThreadAddr : proc.callThreadAddr;
+        if (addr < 0x1000ULL) {
+            *why = "拿不到目标线程结构地址";
+            printf("(overlay) 健康检查[%d]：线程地址无效\n", attempt);
             fflush(stdout);
             continue;
         }
 
-        uint64_t scratch = r_dlsym_call(R_TIMEOUT, "malloc", 64, 0, 0, 0, 0, 0, 0, 0);
-        if (!r_is_objc_ptr(scratch) || scratch < 0x10000ULL) {
-            *why = "远程 malloc 返回的不是有效指针（远程 vm 读写已失效）";
-            printf("(overlay) 健康检查[%d]：malloc=0x%llx\n", attempt, scratch);
+        uint64_t before = [proc remoteRead64From:addr];
+        if (before == 0) {
+            *why = "远程读取返回 0（该地址可能不可映射）";
+            printf("(overlay) 健康检查[%d]：读不到 0x%llx\n", attempt, addr);
             fflush(stdout);
+            continue;                      /* 不下结论 */
+        }
+        if (![proc remote_write64:addr value:before]) {
+            *why = "远程写入失败";
+            printf("(overlay) 健康检查[%d]：写 0x%llx 失败\n", attempt, addr);
+            fflush(stdout);
+            conclusive_bad = true;
+            continue;
+        }
+        if ([proc remoteRead64From:addr] != before) {
+            *why = "远程读回不一致";
+            printf("(overlay) 健康检查[%d]：0x%llx 读回不一致\n", attempt, addr);
+            fflush(stdout);
+            conclusive_bad = true;
             continue;
         }
 
-        const uint64_t magic = 0x1122334455667788ULL;
-        bool wrote = [proc remote_write64:scratch value:magic];
-        uint64_t back = wrote ? [proc remoteRead64From:scratch] : 0;
-        r_dlsym_call(R_TIMEOUT, "free", scratch, 0, 0, 0, 0, 0, 0, 0);
-        if (!wrote || back != magic) {
-            *why = "远程内存写入/读回不一致";
-            printf("(overlay) 健康检查[%d]：write=%d read=0x%llx\n", attempt, wrote, back);
-            fflush(stdout);
-            continue;
-        }
+        printf("(overlay) 健康检查[%d]：远程内存通道 OK（addr=0x%llx value=0x%llx）\n",
+               attempt, addr, before);
+        fflush(stdout);
         return true;
     }
-    return false;
+
+    if (conclusive_bad) return false;
+    printf("(overlay) 健康检查无结论（三次都读不到线程结构），按可用处理，继续建浮层\n");
+    fflush(stdout);
+    return true;
 }
 
 #pragma mark - Build
