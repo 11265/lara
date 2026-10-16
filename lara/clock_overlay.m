@@ -46,9 +46,11 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <dispatch/dispatch.h>
+#import <objc/runtime.h>      /* class_copyMethodList / method_* used by the opt-in device-wide block */
 #import <pthread.h>
 #import <stdarg.h>
 #import <stdio.h>
+#import <stdlib.h>
 #import <string.h>
 
 #pragma mark - Tunables
