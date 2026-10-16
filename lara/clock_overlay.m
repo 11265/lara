@@ -92,6 +92,13 @@ static double gOvLastYaw = 0, gOvLastPitch = 0;
 
 /* 前置声明：ov_build 里会带节奏地循环调用它，定义在文件后半部分 */
 static void ov_build_slots_step(void);
+/* 位图绘制的前置声明（ov_build 里要调用，定义在后面） */
+static bool ov_bitmap_setup(uint64_t clsUIImageView, uint64_t clsUIImage, uint64_t clearColor,
+                            OV_Rect panel, uint64_t host);
+static bool ov_bitmap_ensure_target(void);
+static void ov_bitmap_upload(RemoteCall *proc);
+static bool ov_fb_reserve(int w, int h);
+static void ov_sync_geometry(void);
 
 /* 每格的上一次下发值：只有真的变了才发远程调用。
    远程调用很贵（每次还打印十几行调试），静止画面下应该几乎不发。 */
