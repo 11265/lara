@@ -108,25 +108,31 @@ static void ov_status(const char *fmt, ...)
 
 void clock_overlay_set_url(const char *url)
 {
+    pthread_mutex_lock(&gOvLock);
     if (!url || !url[0]) {
         strncpy(gOvUrl, OV_DEFAULT_URL, sizeof(gOvUrl) - 1);
         gOvUrl[sizeof(gOvUrl) - 1] = '\0';
-        return;
+    } else {
+        strncpy(gOvUrl, url, sizeof(gOvUrl) - 1);
+        gOvUrl[sizeof(gOvUrl) - 1] = '\0';
     }
-    strncpy(gOvUrl, url, sizeof(gOvUrl) - 1);
-    gOvUrl[sizeof(gOvUrl) - 1] = '\0';
+    pthread_mutex_unlock(&gOvLock);
 }
 
 void clock_overlay_set_geometry(double widthRatio, double topMargin)
 {
+    pthread_mutex_lock(&gOvLock);
     gOvWidthRatio = (widthRatio >= 0.2 && widthRatio <= 1.0) ? widthRatio : OV_WEB_WIDTH_RATIO;
     gOvTop = (topMargin >= 0.0 && topMargin <= 600.0) ? topMargin : OV_WEB_TOP;
+    pthread_mutex_unlock(&gOvLock);
 }
 
 void clock_overlay_set_layout(int landscape, int fullscreen)
 {
+    pthread_mutex_lock(&gOvLock);
     gOvLandscape = landscape ? 1 : 0;
     gOvFullscreen = fullscreen ? 1 : 0;
+    pthread_mutex_unlock(&gOvLock);
 }
 
 /* 本机真实分辨率的“长边/短边”。本地读取：远程读 bounds 会把目标卡死。 */
@@ -294,8 +300,12 @@ static uint64_t ov_build_web(RemoteCall *proc, CGRect screen, CGRect frame)
     }
     r_msg2_main(web, "setUserInteractionEnabled:", 0, 0, 0, 0);
     r_msg2_main(web, "setOpaque:", 0, 0, 0, 0);
+    r_msg2_main(web, "setMultipleTouchEnabled:", 0, 0, 0, 0);
     uint64_t scroll = r_msg2_main(web, "scrollView", 0, 0, 0, 0);
     if (r_is_objc_ptr(scroll)) {
+        /* 触摸穿透：窗口 + 网页 + 内部滚动视图全部关掉交互，
+           命中测试会直接跳过整棵子树，手指全部落到下面的游戏里。 */
+        r_msg2_main(scroll, "setUserInteractionEnabled:", 0, 0, 0, 0);
         r_msg2_main(scroll, "setScrollEnabled:", 0, 0, 0, 0);
         r_msg2_main(scroll, "setBounces:", 0, 0, 0, 0);
         r_msg2_main(scroll, "setShowsVerticalScrollIndicator:", 0, 0, 0, 0);
@@ -536,7 +546,7 @@ static bool ov_build(RemoteCall *proc)
         content = ov_build_pill(screen, pillFrame);
     }
     step++;
-    ov_status("[%d/6] content=0x%llx web=%d frame=%.0f,%.0f %.0fx%.0f url=%s",
+    ov_status("[%d/6] content=0x%llx web=%d frame=%.0f,%.0f %.0fx%.0f 触摸穿透=开 url=%s",
               step, content, gOvWebMode ? 1 : 0,
               webFrame.origin.x, webFrame.origin.y, webFrame.size.width, webFrame.size.height, gOvUrl);
     if (!r_is_objc_ptr(content)) return false;

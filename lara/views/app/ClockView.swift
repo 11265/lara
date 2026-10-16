@@ -18,6 +18,12 @@ struct ClockView: View {
     @AppStorage("fpvWidth") private var fpvWidth: Double = 0.92
     @AppStorage("fpvTop") private var fpvTop: Double = 56
     @AppStorage("fpvFullscreen") private var fpvFullscreen: Bool = false
+    @AppStorage("fpvFov") private var fpvFov: Double = 90
+    @AppStorage("fpvEye") private var fpvEye: Double = 1.6
+    @AppStorage("fpvTau") private var fpvTau: Double = 70
+    @AppStorage("fpvDist") private var fpvDist: Bool = true
+    @AppStorage("fpvCross") private var fpvCross: Bool = true
+    @AppStorage("fpvHud") private var fpvHud: Bool = true
 
     @State private var probe = ""
     @State private var probing = false
@@ -51,7 +57,10 @@ struct ClockView: View {
             }
 
             Section {
-                TextField("http://192.168.137.1:18099/", text: $fpvURL)
+                TextField("http://192.168.137.1:18099/", text: Binding(
+                    get: { fpvURL },
+                    set: { fpvURL = $0; mgr.refreshOverlayUrl() }
+                ))
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled(true)
                     .keyboardType(.URL)
@@ -118,6 +127,49 @@ struct ClockView: View {
                 Text("尺寸 · 方向")
             } footer: {
                 Text("尺寸按本机真实分辨率算：面板模式高宽比 16:9，全屏模式铺满整屏（顶部距离仍生效）。横屏时浮层自动按设备方向旋转铺开——把手机横过来即可，页面不会重新加载。")
+            }
+
+            Section {
+                Toggle(isOn: Binding(get: { fpvCross },
+                                     set: { fpvCross = $0; mgr.refreshOverlayUrl() })) {
+                    Text("准星")
+                }
+                Toggle(isOn: Binding(get: { fpvDist },
+                                     set: { fpvDist = $0; mgr.refreshOverlayUrl() })) {
+                    Text("距离文字")
+                }
+                Toggle(isOn: Binding(get: { fpvHud },
+                                     set: { fpvHud = $0; mgr.refreshOverlayUrl() })) {
+                    Text("状态信息（连接/帧率/朝向）")
+                }
+                HStack {
+                    Text("视场角 FOV")
+                    Slider(value: Binding(get: { fpvFov },
+                                          set: { fpvFov = $0; mgr.refreshOverlayUrl() }), in: 60...120, step: 2)
+                    Text("\(Int(fpvFov))°")
+                        .font(.system(.caption, design: .monospaced))
+                        .frame(width: 46, alignment: .trailing)
+                }
+                HStack {
+                    Text("眼高")
+                    Slider(value: Binding(get: { fpvEye },
+                                          set: { fpvEye = $0; mgr.refreshOverlayUrl() }), in: 0.6...2.6, step: 0.1)
+                    Text(String(format: "%.1fm", fpvEye))
+                        .font(.system(.caption, design: .monospaced))
+                        .frame(width: 46, alignment: .trailing)
+                }
+                HStack {
+                    Text("跟手（越小越跟手）")
+                    Slider(value: Binding(get: { fpvTau },
+                                          set: { fpvTau = $0; mgr.refreshOverlayUrl() }), in: 0...300, step: 10)
+                    Text("\(Int(fpvTau))ms")
+                        .font(.system(.caption, design: .monospaced))
+                        .frame(width: 46, alignment: .trailing)
+                }
+            } header: {
+                Text("画面")
+            } footer: {
+                Text("悬浮层完全不吃触摸（全部穿透给游戏），页面上没有任何按钮——所有开关都在这里。改动会在一秒内热重载生效，不用重启 lara。")
             }
 
             if !mgr.clockstatus.isEmpty {

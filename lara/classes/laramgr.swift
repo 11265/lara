@@ -722,6 +722,31 @@ final class laramgr: ObservableObject {
 
     private var lastLandscape = false
 
+    /// 悬浮层完全不吃触摸，所以画面参数全部由 app 写进页面地址：
+    /// 改了设置 → 浮层每秒比对地址 → 变了就热重载（不用重启、不用点屏幕）。
+    func fpvEffectiveURL() -> String {
+        var base = (UserDefaults.standard.string(forKey: "fpvURL") ?? Self.fpvDefaultURL)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if base.isEmpty { base = Self.fpvDefaultURL }
+        let d = UserDefaults.standard
+        var items: [String] = []
+        if let fov = d.object(forKey: "fpvFov") as? Double { items.append("fov=\(Int(fov))") }
+        if let eye = d.object(forKey: "fpvEye") as? Double {
+            items.append("eye=" + String(format: "%.1f", eye))
+        }
+        if let tau = d.object(forKey: "fpvTau") as? Double { items.append("tau=\(Int(tau))") }
+        if d.object(forKey: "fpvDist") != nil { items.append("dist=\(d.bool(forKey: "fpvDist") ? 1 : 0)") }
+        if d.object(forKey: "fpvCross") != nil { items.append("cross=\(d.bool(forKey: "fpvCross") ? 1 : 0)") }
+        if d.object(forKey: "fpvHud") != nil { items.append("hud=\(d.bool(forKey: "fpvHud") ? 1 : 0)") }
+        guard !items.isEmpty else { return base }
+        return base + (base.contains("?") ? "&" : "?") + items.joined(separator: "&")
+    }
+
+    /// 设置变更后调用：把新地址推给浮层（浮层活着就热重载，没开就等下次启动用）。
+    func refreshOverlayUrl() {
+        fpvEffectiveURL().withCString { clock_overlay_set_url($0) }
+    }
+
     func startClock() {
         guard dsready, let sbProc, !clockrunning, !clockstarting else { return }
         // 上次把远程会话弄坏后就上锁：不再自动重试，避免反复冲击参数缓冲区把 SpringBoard 打崩
@@ -736,8 +761,8 @@ final class laramgr: ObservableObject {
             UserDefaults.standard.set(true, forKey: "keepAlive")
             logmsg("(fpv) 已自动开启后台保活")
         }
-        // 页面地址与尺寸来自设置（第一视角页）
-        let url = UserDefaults.standard.string(forKey: "fpvURL") ?? Self.fpvDefaultURL
+        // 页面地址（含 app 里的画面参数）与尺寸来自设置（第一视角页）
+        let url = fpvEffectiveURL()
         let ratio = UserDefaults.standard.object(forKey: "fpvWidth") as? Double ?? 0.92
         let top = UserDefaults.standard.object(forKey: "fpvTop") as? Double ?? 56.0
         url.withCString { clock_overlay_set_url($0) }
