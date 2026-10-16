@@ -83,7 +83,8 @@ static unsigned gOvTick = 0;
    SpringBoard 崩溃。所以：同一时刻只允许一次构建；一旦失败，绝不再自动重试。 */
 static bool gOvBuilding = false;
 static bool gOvFailed = false;
-static unsigned gOvGuard = 0;      /* 触摸穿透自愈计数（每 8 个 tick = 2 秒一次） */
+static unsigned gOvGuard = 0;      /* 触摸穿透自愈计数（每 120 个 tick = 30 秒一次） */
+static unsigned gOvWebWait = 0;    /* 网页加载等待计数（24 个 tick = 6 秒） */
 
 /* 方向 / 全屏：由 lara 主线程用设备方向推过来（见 clock_overlay_set_layout）。
    目标进程的窗口空间跟随设备方向，所以横屏 = 长短边对调；尺寸全部按本机真实
@@ -109,6 +110,15 @@ static void ov_set_int(uint64_t obj, const char *sel, long long value)
     if (!r_is_objc_ptr(obj)) return;
     long long v = value;
     r_msg2_main_raw(obj, sel, &v, sizeof(v), NULL, 0, NULL, 0, NULL, 0);
+}
+/* 设置 UILabel 文本（对象参数，走 r_msg2_main；字符串在目标侧 retained 后要释放）。 */
+static void ov_set_text(uint64_t obj, const char *utf8)
+{
+    if (!r_is_objc_ptr(obj) || !utf8) return;
+    uint64_t str = r_nsstr_retained(utf8);
+    if (!r_is_objc_ptr(str)) return;
+    r_msg2_main(obj, "setText:", str, 0, 0, 0);
+    r_dlsym_call(R_TIMEOUT, "CFRelease", str, 0, 0, 0, 0, 0, 0, 0);
 }
 
 static void ov_status(const char *fmt, ...)
@@ -426,21 +436,37 @@ static void ov_tick(void)
 
     /* 触摸穿透自愈：iOS 有时会重建窗口内部视图、把交互重新打开，
        而一个 999999 层级、全屏的窗口一旦变回“可交互”，就会把游戏的手指全吃掉
-       （真机现象：桌面和 lara 能点、别的游戏点不动）。这里每 2 秒重新关一次，
-       并把回读值打进日志，让穿透状态可验证。 */
-    if (++gOvGuard >= 8) {
+       （真机现象：桌面和 lara 能点、别的游戏点不动）。
+       注意频率：每次远程调用都会往日志写十几行 (rc)/(pac)，所以这里 30 秒才查一次，
+       而且只在读回值真的不对时才动手，避免把日志刷爆、影响排障。 */
+    if (++gOvGuard >= 120) {                       /* 120 * 250ms = 30s */
         gOvGuard = 0;
-        ov_set_bool(gOvWindow, "setUserInteractionEnabled:", 0);
-        if (r_is_objc_ptr(gOvWeb)) {
-            ov_set_bool(gOvWeb, "setUserInteractionEnabled:", 0);
-            uint64_t scroll = r_msg2_main(gOvWeb, "scrollView", 0, 0, 0, 0);
-            if (r_is_objc_ptr(scroll)) ov_set_bool(scroll, "setUserInteractionEnabled:", 0);
-        }
         uint64_t winUI = r_msg2_main(gOvWindow, "isUserInteractionEnabled", 0, 0, 0, 0);
         if ((winUI & 0xff) != 0) {
-            printf("(overlay) 警告：窗口又变成可交互（winUI=%u），已再次关闭\n",
+            printf("(overlay) 警告：窗口又变成可交互（winUI=%u），再次关闭\n",
                    (unsigned)(winUI & 0xff));
             fflush(stdout);
+            ov_set_bool(gOvWindow, "setUserInteractionEnabled:", 0);
+            if (r_is_objc_ptr(gOvWeb)) ov_set_bool(gOvWeb, "setUserInteractionEnabled:", 0);
+        }
+    }
+
+    /* 网页加载失败兜底：全透明之后，一个加载不出来的 WKWebView 就是“什么都看不见”，
+       用户只会觉得没生效。所以发现长时间没加载完就把原生提示条显示出来（带地址与原因）。 */
+    if (gOvWebMode && r_is_objc_ptr(gOvWeb)) {
+        uint64_t loading = r_msg2_main(gOvWeb, "isLoading", 0, 0, 0, 0);
+        if ((loading & 0xff) != 0) {
+            if (gOvWebWait++ == 24) {              /* 24 * 250ms = 6s 还没好 */
+                printf("(overlay) 网页 6 秒仍未加载完成，显示原生提示（地址：%s）\n", gOvUrl);
+                fflush(stdout);
+                if (r_is_objc_ptr(gOvPill)) {
+                    ov_set_bool(gOvPill, "setHidden:", 0);
+                    ov_set_text(gOvPill, "第一视角：连不上电脑服务");
+                }
+            }
+        } else if (gOvWebWait) {
+            gOvWebWait = 0;
+            if (r_is_objc_ptr(gOvPill)) ov_set_bool(gOvPill, "setHidden:", 1);
         }
     }
     pthread_mutex_unlock(&gOvLock);
@@ -599,10 +625,17 @@ static bool ov_build(RemoteCall *proc)
     gOvWebMode = false;
     CGRect pillFrame = ov_content_frame();
 
-    uint64_t content = ov_build_web(proc, screen, webFrame);
-    if (!r_is_objc_ptr(content)) {
-        content = ov_build_pill(screen, pillFrame);
+    uint64_t web = ov_build_web(proc, screen, webFrame);
+    bool webOk = r_is_objc_ptr(web);
+    /* 提示条始终建好（网页模式下先隐藏）：网页加载不出来时它显形，
+       否则全透明的浮层什么都看不见，用户只会觉得“没生效”。 */
+    uint64_t pill = ov_build_pill(screen, pillFrame);
+    if (r_is_objc_ptr(pill) && webOk) {
+        /* 两个视图都带 OV_TAG 会让 viewWithTag: 返回上面的提示条，校验就会误判成失败 */
+        ov_set_int(pill, "setTag:", (long long)(OV_TAG + 1));
     }
+    gOvWebMode = webOk;
+    uint64_t content = webOk ? web : pill;
     step++;
     ov_status("[%d/6] content=0x%llx web=%d frame=%.0f,%.0f %.0fx%.0f 触摸穿透=开 url=%s",
               step, content, gOvWebMode ? 1 : 0,
@@ -610,9 +643,18 @@ static bool ov_build(RemoteCall *proc)
     if (!r_is_objc_ptr(content)) return false;
 
     /* 6/6 — attach, show, verify. */
-    r_msg2_main(window, "addSubview:", content, 0, 0, 0);
+    if (webOk && r_is_objc_ptr(pill)) {
+        /* 网页在下、提示条在上；提示条默认隐藏，只在网页失败时显形 */
+        r_msg2_main(window, "addSubview:", web, 0, 0, 0);
+        r_msg2_main(window, "addSubview:", pill, 0, 0, 0);
+        ov_set_bool(pill, "setHidden:", 1);
+        ov_set_text(pill, "第一视角：连接电脑服务中…");
+    } else {
+        r_msg2_main(window, "addSubview:", content, 0, 0, 0);
+    }
     ov_set_bool(window, "setHidden:", 0);
     ov_set_bool(content, "setHidden:", 0);
+    if (r_is_objc_ptr(gOvWeb)) ov_set_bool(gOvWeb, "setHidden:", 0);
 
     uint64_t found = r_msg2_main(window, "viewWithTag:", (uint64_t)OV_TAG, 0, 0, 0);
     /* 回读校验：触摸穿透靠的就是这几个值必须是 0，日志里直接写出结果 */
