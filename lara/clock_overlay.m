@@ -45,7 +45,7 @@
 #define OV_SNAP_MAX           4096
 #define OV_MAX_SLOTS          48
 #define OV_DEFAULT_SLOTS      24
-#define OV_TICK_HZ            20                      /* 绘制帧率 */
+#define OV_TICK_HZ            10                      /* 绘制帧率（每次远程调用都较贵，10Hz 足够顺滑） */
 #define OV_TICK_MS            (1000 / OV_TICK_HZ)
 #define OV_DEFAULT_FOV        90.0
 #define OV_DEFAULT_EYE        1.60
