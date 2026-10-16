@@ -433,6 +433,8 @@ static bool ov_build(RemoteCall *proc)
     uint64_t clsView  = r_class("UIView");
     uint64_t clsLabel = r_class("UILabel");
     uint64_t clsFont  = r_class("UIFont");
+    uint64_t clsImageView = r_class("UIImageView");   /* 位图绘制：目标侧唯一的视图 */
+    uint64_t clsImage     = r_class("UIImage");
     step++;
     ov_status("[%d/6] 类: app=0x%llx win=0x%llx view=0x%llx label=0x%llx",
               step, clsApp, clsWin, clsView, clsLabel);
@@ -468,28 +470,31 @@ static bool ov_build(RemoteCall *proc)
     if (r_is_objc_ptr(clear)) r_msg2_main(win, "setBackgroundColor:", clear, 0, 0, 0);
     ov_set_bool(win, "setHidden:", 1);
 
-    /* 裁剪容器：方框/文字画在里面，用「宽度/顶部/高度」限制可见区域；
-       投影和准星不受它影响（都锚定屏幕正中，和游戏 1:1）。 */
-    gOvClipX = px; gOvClipY = py; gOvClipW = pw; gOvClipH = ph;
-    gOvClip = ov_make_view(clsView, clear, 0.0, 0, (OV_Rect){px, py, pw, ph}, false);
-    if (r_is_objc_ptr(gOvClip)) {
-        ov_set_bool(gOvClip, "setClipsToBounds:", 1);
-        r_msg2_main(win, "addSubview:", gOvClip, 0, 0, 0);
-    }
+    /* 裁剪容器不再需要：位图本身就是面板大小，天然裁剪。 */
+    (void)clear;
 
     step++;
-    ov_status("[%d/6] window=0x%llx 投影=整屏%.0fx%.0f 裁剪区=%.0f,%.0f %.0fx%.0f 方向=%s%s",
+    ov_status("[%d/6] window=0x%llx 投影=整屏%.0fx%.0f 面板=%.0f,%.0f %.0fx%.0f 方向=%s%s",
               step, win, sw, sh, px, py, pw, ph, gOvLandscape ? "横屏" : "竖屏", gOvFullscreen ? " 全屏" : "");
 
-    /* 字体/颜色 */
+    /* 位图绘制：建目标侧的像素内存 + 位图上下文 + 唯一那个 UIImageView */
+    int slots = gOvMaxSlots;
+    if (slots < 1) slots = 1;
+    if (slots > OV_MAX_SLOTS) slots = OV_MAX_SLOTS;
+    gOvSlotTarget = slots;
+    gOvBuilderStep = slots;
+    gOvCrossDone = true;
+    gOvBuildFailed = false;
+    if (!ov_bitmap_setup(clsImageView, clsImage, clear, (OV_Rect){px, py, pw, ph}, win)) {
+        gOvBuildFailed = true;
+    }
+
+    /* 字体/颜色已经不需要（画面在 lara 侧画成像素） —— 保留对象解析只为兼容日志 */
     uint64_t font = 0;
     if (r_is_objc_ptr(clsFont)) {
         double fs = 11.0, wt = 0.6;
         font = r_msg2_main_raw(clsFont, "systemFontOfSize:weight:",
                                &fs, sizeof(fs), &wt, sizeof(wt), NULL, 0, NULL, 0);
-        if (!r_is_objc_ptr(font)) {
-            font = r_msg2_main_raw(clsFont, "systemFontOfSize:", &fs, sizeof(fs), NULL, 0, NULL, 0, NULL, 0);
-        }
     }
     uint64_t white = 0, red = 0, blue = 0, orange = 0;
     uint64_t whiteCG = 0, redCG = 0;
@@ -498,40 +503,15 @@ static bool ov_build(RemoteCall *proc)
         red    = r_msg2_main(clsColor, "systemRedColor", 0, 0, 0, 0);
         blue   = r_msg2_main(clsColor, "systemBlueColor", 0, 0, 0, 0);
         orange = r_msg2_main(clsColor, "systemOrangeColor", 0, 0, 0, 0);
-        /* layer.borderColor 要的是 CGColor（CFTypeRef）：直接传 UIColor 会把目标弄崩 */
         if (r_is_objc_ptr(white)) whiteCG = r_msg2_main(white, "CGColor", 0, 0, 0, 0);
         if (r_is_objc_ptr(red))   redCG   = r_msg2_main(red, "CGColor", 0, 0, 0, 0);
     }
-    (void)blue; (void)orange;
-
-    /* 方框 + 距离文字：改成「增量创建」。
-       真机日志显示：连续密集远程调用到 ~19 次时目标进程就会崩，
-       一次性建 24 对必崩。所以建窗时一个都不建，之后每帧只建一对，
-       失败也只丢那一格，不会整体失败。字体/颜色缓存起来给后续帧用。 */
-    int slots = gOvMaxSlots;
-    if (slots < 1) slots = 1;
-    if (slots > OV_MAX_SLOTS) slots = OV_MAX_SLOTS;
-    gOvSlotTarget   = slots;
-    gOvBuilderStep  = 0;
-    gOvBuildFailed  = false;
-    gOvCrossDone    = false;
-    gOvFont         = font;
-    gOvWhiteColor   = white;
-    gOvRedCGColor   = redCG;
-    gOvClearColor   = clear;
-    gOvClsView      = clsView;
-    gOvClsLabel     = clsLabel;
-    gOvSlotsAllocated = 0;
-    ov_status("[5/6] 窗口已就绪；先建准星，再建 %d 个方框（每步之间 20ms，避免压崩目标）", slots);
-
-    /* 每步只有 5~6 次远程调用（连续密集调用到 ~19 次目标就会崩）。
-       第一步建准星（立刻可见），其后 %d 步每步建一对（方框+距离文字）。
-       带节奏地建，约 0.5~0.8 秒就在前台期间全部建好。 */
-    for (int i = 0; i <= slots && !gOvBuildFailed; i++) {
-        ov_crumb("build step %d/%d calls=%lu\n", i, slots + 1, gOvCallCount);
-        ov_build_slots_step();
-        if (!gOvBuildFailed) usleep(20 * 1000);
-    }
+    (void)blue; (void)orange; (void)whiteCG; (void)redCG; (void)font;
+    gOvFont = font;
+    gOvWhiteColor = white;
+    gOvClsView = clsView;
+    gOvClsLabel = clsLabel;
+    gOvSlotsAllocated = slots;
 
     ov_set_bool(win, "setHidden:", 0);
     if (r_responds(win, "resignKeyWindow")) r_msg2_main(win, "resignKeyWindow", 0, 0, 0, 0);
@@ -552,73 +532,210 @@ static bool ov_build(RemoteCall *proc)
 /* 增量建层：**先建准星**，再一格一格建方框+文字。
    准星钉在屏幕正中、不裁剪，所以哪怕建方框的过程被打断（切到游戏后 lara 被挂起），
    画面上也一定先有一个准星可见；方框按 20ms 一格慢慢补，避免把目标进程压崩。 */
-static void ov_build_slots_step(void)
-{
-    if (!r_is_objc_ptr(gOvWindow)) return;
+/* ── 位图绘制（方案 A）──────────────────────────────────────────────────
+   目标侧只放**一个 UIImageView**，画面由 lara 这边画进一块 RGBA 位图后整块提交。
 
-    if (!gOvCrossDone) {
-        double sw = 0, sh = 0;
-        ov_screen_wh(&sw, &sh);
-        double cx = sw / 2.0, cy = sh / 2.0;               /* 准星钉在屏幕正中（和游戏准星重合） */
-        OV_Rect h = {cx - 9.0, cy - 0.75, 18.0, 1.5};
-        OV_Rect v = {cx - 0.75, cy - 9.0, 1.5, 18.0};
-        gOvCrossH = ov_make_view(gOvClsView, gOvWhiteColor, 0.0, 0, h, false);
-        gOvCrossV = ov_make_view(gOvClsView, gOvWhiteColor, 0.0, 0, v, false);
-        if (!r_is_objc_ptr(gOvCrossH) || !r_is_objc_ptr(gOvCrossV)) {
-            gOvBuildFailed = true;
-            ov_status("[5/6] 准星创建失败（h=0x%llx v=0x%llx，已用调用 %lu 次）",
-                      gOvCrossH, gOvCrossV, gOvCallCount);
-            return;
+   为什么换：旧方案每格要 setFrame/setHidden/setText 等标量 setter，而真机上
+   **每个标量 setter 内部约 13 次远程调用**（NSInvocation + pac 线程），8 格一帧
+   就是几百次远程调用 —— 这正是把 lara 拖死、SpringBoard 跟着崩的根源。
+   换成位图后每帧只要：
+     remote_write(整块像素) → CGBitmapContextCreateImage → setImage: → CGImageRelease
+   共 4 次远程调用，而且像素没变时一次都不发。
+
+   位图尺寸 = 面板尺寸（点为单位 1:1），方框按「屏幕坐标 − 面板原点」直接画进去，
+   所以天然被面板裁剪（不再需要裁剪容器），也不会再有位置偏移。 */
+
+static uint8_t *gOvFB = NULL;          /* lara 侧像素：RGBA8888，预乘 alpha */
+static uint8_t *gOvFBPrev = NULL;      /* 上一帧，用于判断内容是否变化 */
+static size_t   gOvFBCap = 0, gOvFBPrevCap = 0;
+static int      gOvFBW = 0, gOvFBH = 0;
+static bool     gOvFBForce = true;
+
+static uint64_t gOvFBView = 0;         /* 目标侧 UIImageView（唯一的视图） */
+static uint64_t gOvFBPixels = 0;       /* 目标侧的像素内存 */
+static uint64_t gOvFBContext = 0;      /* 目标侧 CGBitmapContext */
+static uint64_t gOvFBImage = 0;        /* 目标侧当前 CGImage（每帧替换，旧的释放） */
+static uint64_t gOvClsUIImage = 0;
+
+/* 面板里那个 UIImageView 当前 frame + 会话对象（提交像素要用） */
+static double gOvFBViewX = -1, gOvFBViewY = -1, gOvFBViewW = -1, gOvFBViewH = -1;
+static RemoteCall *gOvProc = nil;
+
+/* 目标侧像素内存 + 位图上下文（首次或尺寸变化时创建） */
+static bool ov_bitmap_ensure_target(void)
+{
+    if (gOvFBW <= 0 || gOvFBH <= 0) return false;
+    if (r_is_objc_ptr(gOvFBPixels) && r_is_objc_ptr(gOvFBContext)) return true;
+
+    gOvFBPixels = r_dlsym_call(R_TIMEOUT, "malloc",
+                               (uint64_t)((size_t)gOvFBW * (size_t)gOvFBH * 4),
+                               0, 0, 0, 0, 0, 0, 0);
+    if (!r_is_objc_ptr(gOvFBPixels)) {
+        ov_status("目标侧像素内存分配失败（%dx%d）", gOvFBW, gOvFBH);
+        return false;
+    }
+    uint64_t space = r_dlsym_call(R_TIMEOUT, "CGColorSpaceCreateDeviceRGB", 0, 0, 0, 0, 0, 0, 0, 0);
+    gOvFBContext = r_dlsym_call(R_TIMEOUT, "CGBitmapContextCreate",
+                                gOvFBPixels, (uint64_t)gOvFBW, (uint64_t)gOvFBH, 8,
+                                (uint64_t)(gOvFBW * 4), space, 1 /* premultipliedLast */, 0);
+    if (!r_is_objc_ptr(gOvFBContext)) {
+        ov_status("CGBitmapContextCreate 失败（%dx%d）", gOvFBW, gOvFBH);
+        return false;
+    }
+    if (r_is_objc_ptr(gOvFBImage)) {
+        r_dlsym_call(R_TIMEOUT, "CGImageRelease", gOvFBImage, 0, 0, 0, 0, 0, 0, 0);
+        gOvFBImage = 0;
+    }
+    gOvFBForce = true;
+    return true;
+}
+
+/* 3x5 点阵：0-9 + 'm'（每行 3 bit，够显示"12m"这种） */
+static const uint8_t kOvFont3x5[11][5] = {
+    {7, 5, 5, 5, 7}, {2, 6, 2, 2, 7}, {7, 1, 7, 4, 7}, {7, 1, 7, 1, 7}, {5, 5, 7, 1, 1},
+    {7, 4, 7, 1, 7}, {7, 4, 7, 5, 7}, {7, 1, 1, 1, 1}, {7, 5, 7, 5, 7}, {7, 5, 7, 1, 7},
+    {5, 7, 5, 5, 5}   /* 'm' */
+};
+
+static inline void ov_fb_px(int x, int y, uint8_t r, uint8_t g, uint8_t b)
+{
+    if (!gOvFB || x < 0 || y < 0 || x >= gOvFBW || y >= gOvFBH) return;
+    uint8_t *q = gOvFB + ((size_t)y * (size_t)gOvFBW + (size_t)x) * 4;
+    q[0] = r; q[1] = g; q[2] = b; q[3] = 255;    /* 预乘 alpha：不透明 */
+}
+
+static void ov_fb_rect(double x, double y, double w, double h, uint8_t r, uint8_t g, uint8_t b)
+{
+    int x0 = (int)floor(x), y0 = (int)floor(y);
+    int x1 = (int)ceil(x + w), y1 = (int)ceil(y + h);
+    if (x1 <= x0 || y1 <= y0) return;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > gOvFBW) x1 = gOvFBW;
+    if (y1 > gOvFBH) y1 = gOvFBH;
+    for (int yy = y0; yy < y1; yy++) {
+        uint8_t *row = gOvFB + ((size_t)yy * (size_t)gOvFBW + (size_t)x0) * 4;
+        for (int xx = x0; xx < x1; xx++) {
+            row[0] = r; row[1] = g; row[2] = b; row[3] = 255;
+            row += 4;
         }
-        r_msg2_main(gOvWindow, "addSubview:", gOvCrossH, 0, 0, 0);
-        r_msg2_main(gOvWindow, "addSubview:", gOvCrossV, 0, 0, 0);
-        r_msg2_main(gOvCrossH, "setHidden:", gOvShowCross ? 0 : 1, 0, 0, 0);
-        r_msg2_main(gOvCrossV, "setHidden:", gOvShowCross ? 0 : 1, 0, 0, 0);
-        gOvCrossCx = cx; gOvCrossCy = cy;
-        gOvCrossDone = true;
-        ov_status("[5/6] 准星就绪：屏幕正中 %.0f,%.0f（累计远程调用约 %lu 次）", cx, cy, gOvCallCount);
+    }
+}
+
+static void ov_fb_glyph(int idx, int x, int y, int scale, uint8_t r, uint8_t g, uint8_t b)
+{
+    if (idx < 0 || idx > 10) return;
+    for (int row = 0; row < 5; row++) {
+        uint8_t bits = kOvFont3x5[idx][row];
+        for (int col = 0; col < 3; col++) {
+            if (bits & (1 << (2 - col))) {
+                ov_fb_rect(x + col * scale, y + row * scale, scale, scale, r, g, b);
+            }
+        }
+    }
+}
+
+static void ov_fb_text_m(int value, int x, int y, int scale, uint8_t r, uint8_t g, uint8_t b)
+{
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%d", value);
+    int cx = x;
+    for (const char *p = buf; *p; p++) {
+        if (*p >= '0' && *p <= '9') ov_fb_glyph(*p - '0', cx, y, scale, r, g, b);
+        cx += 4 * scale;
+    }
+    ov_fb_glyph(10, cx, y, scale, r, g, b);      /* 'm' */
+}
+
+static bool ov_fb_reserve(int w, int h)
+{
+    if (w <= 0 || h <= 0 || w > 4096 || h > 4096) return false;
+    size_t need = (size_t)w * (size_t)h * 4;
+    if (gOvFB && gOvFBW == w && gOvFBH == h && gOvFBCap >= need) return true;
+    uint8_t *buf = (uint8_t *)malloc(need);
+    if (!buf) return false;
+    free(gOvFB);
+    gOvFB = buf;
+    gOvFBCap = need;
+    gOvFBW = w;
+    gOvFBH = h;
+    if (gOvFBPrevCap < need) {
+        free(gOvFBPrev);
+        gOvFBPrev = (uint8_t *)malloc(need);
+        gOvFBPrevCap = gOvFBPrev ? need : 0;
+    }
+    gOvFBForce = true;
+    return true;
+}
+
+/* 目标侧：像素内存 + 位图上下文 + 唯一那个 UIImageView */
+static bool ov_bitmap_setup(uint64_t clsUIImageView, uint64_t clsUIImage, uint64_t clearColor,
+                            OV_Rect panel, uint64_t host)
+{
+    gOvClsUIImage = clsUIImage;
+    int w = (int)(panel.w + 0.5), h = (int)(panel.h + 0.5);
+    if (!ov_fb_reserve(w, h)) {
+        ov_status("[5/6] 位图分配失败 %dx%d", w, h);
+        return false;
+    }
+    gOvFBPixels = 0; gOvFBContext = 0; gOvFBImage = 0;   /* 尺寸可能变了：强制重建 */
+    if (!ov_bitmap_ensure_target()) return false;
+
+    uint64_t alloc = r_msg2_main(clsUIImageView, "alloc", 0, 0, 0, 0);
+    OV_Rect fr = panel;
+    uint64_t iv = r_is_objc_ptr(alloc)
+        ? r_msg2_main_raw(alloc, "initWithFrame:", &fr, sizeof(fr), NULL, 0, NULL, 0, NULL, 0)
+        : 0;
+    if (!r_is_objc_ptr(iv)) {
+        ov_status("[5/6] UIImageView 创建失败");
+        return false;
+    }
+    if (r_is_objc_ptr(clearColor)) r_msg2_main(iv, "setBackgroundColor:", clearColor, 0, 0, 0);
+    r_msg2_main(iv, "setOpaque:", 0, 0, 0, 0);
+    r_msg2_main(iv, "setUserInteractionEnabled:", 0, 0, 0, 0);
+    r_msg2_main(host, "addSubview:", iv, 0, 0, 0);
+    gOvFBView = iv;
+    gOvFBForce = true;
+    ov_status("[5/6] 位图绘制就绪：%dx%d，目标侧只有 1 个 UIImageView", w, h);
+    return true;
+}
+
+/* 每帧提交：像素没变就一次远程调用都不发 */
+static void ov_bitmap_upload(RemoteCall *proc)
+{
+    if (!r_is_objc_ptr(gOvFBView) || !gOvFB || !r_is_objc_ptr(gOvFBContext) || !r_is_objc_ptr(gOvFBPixels)) return;
+    size_t len = (size_t)gOvFBW * (size_t)gOvFBH * 4;
+    if (!gOvFBForce && gOvFBPrev && memcmp(gOvFB, gOvFBPrev, len) == 0) return;
+    if (gOvFBPrev) memcpy(gOvFBPrev, gOvFB, len);
+    gOvFBForce = false;
+
+    if (![proc remote_write:gOvFBPixels from:gOvFB size:(uint64_t)len]) {
+        ov_crumb("bitmap upload failed (remote_write)\n");
         return;
     }
+    uint64_t img = r_dlsym_call(R_TIMEOUT, "CGBitmapContextCreateImage", gOvFBContext, 0, 0, 0, 0, 0, 0, 0);
+    if (!r_is_objc_ptr(img)) return;
+    uint64_t ui = r_is_objc_ptr(gOvClsUIImage) ? r_msg2_main(gOvClsUIImage, "imageWithCGImage:", img, 0, 0, 0) : 0;
+    if (r_is_objc_ptr(ui)) r_msg2_main(gOvFBView, "setImage:", ui, 0, 0, 0);
+    if (r_is_objc_ptr(gOvFBImage)) {
+        r_dlsym_call(R_TIMEOUT, "CGImageRelease", gOvFBImage, 0, 0, 0, 0, 0, 0, 0);
+    }
+    gOvFBImage = img;
+}
 
-    if (gOvBuilderStep < gOvSlotTarget) {
-        int i = gOvBuilderStep;
-        uint64_t host = r_is_objc_ptr(gOvClip) ? gOvClip : gOvWindow;
-        OV_Rect r0 = {0, 0, 0, 0};
-        uint64_t box = ov_make_view(gOvClsView, gOvClearColor, 2.0, gOvRedCGColor, r0, i == 0);
-        if (!r_is_objc_ptr(box)) {
-            gOvBuildFailed = true;
-            ov_status("[5/6] 第 %d 个方框创建失败（box=0x%llx，已用调用 %lu 次）", i, box, gOvCallCount);
-            return;
-        }
-        r_msg2_main(host, "addSubview:", box, 0, 0, 0);
-        gOvBox[i] = box;
-
-        OV_Rect r2 = {0, 0, 0, 0};
-        uint64_t ds = ov_make_label(gOvClsLabel, gOvFont, gOvWhiteColor, gOvClearColor, 1, r2, i == 0);
-        if (!r_is_objc_ptr(ds)) {
-            gOvBuildFailed = true;
-            ov_status("[5/6] 第 %d 个文字创建失败（label=0x%llx，已用调用 %lu 次）", i, ds, gOvCallCount);
-            return;
-        }
-        r_msg2_main(host, "addSubview:", ds, 0, 0, 0);
-        gOvDist[i] = ds;
-        gOvName[i] = 0;
-        gOvCallCount += 6;
-
-        gOvSlotsAllocated = i + 1;
-        gOvBuilderStep = i + 1;
-        if (gOvBuilderStep == 1 || gOvBuilderStep == gOvSlotTarget || gOvBuilderStep % 8 == 0) {
-            ov_status("[5/6] 格子进度 %d/%d（累计远程调用约 %lu 次）",
-                      gOvBuilderStep, gOvSlotTarget, gOvCallCount);
-        }
-        return;
+/* 位图方案下没有"逐格建视图"这回事：视图在 ov_build 里一次建好。 */
+static void ov_build_slots_step(void)
+{
+    if (r_is_objc_ptr(gOvFBView)) {
+        gOvBuilderStep = gOvSlotTarget;
+        gOvCrossDone = true;
     }
 }
 
 #pragma mark - 每帧绘制
 
-/* 把裁剪容器摆到当前面板矩形，并把准星重新钉到屏幕正中。
-   只在几何真正变化时发远程调用，所以拖滑块/切方向才会重排，平时零开销。 */
+/* 面板/屏幕几何变化时：重算位图尺寸、重定位那个 UIImageView。
+   只在真正变化时发远程调用，所以拖滑块/切方向才动，平时零开销。 */
 static void ov_sync_geometry(void)
 {
     double sw = 0, sh = 0;
@@ -627,26 +744,19 @@ static void ov_sync_geometry(void)
     ov_panel_rect(&px, &py, &pw, &ph);
     if (gOvFullscreen) { px = 0; py = 0; pw = sw; ph = sh; }
 
-    if (r_is_objc_ptr(gOvClip) &&
-        (gOvClipX != px || gOvClipY != py || gOvClipW != pw || gOvClipH != ph)) {
-        OV_Rect clip = {px, py, pw, ph};
-        ov_set_rect(gOvClip, "setFrame:", clip);
-        gOvClipX = px; gOvClipY = py; gOvClipW = pw; gOvClipH = ph;
-    }
-
-    /* 准星钉在屏幕正中（和游戏准星重合），与面板/裁剪区无关 */
-    double cx = sw / 2.0, cy = sh / 2.0;
-    if (gOvCrossCx != cx || gOvCrossCy != cy) {
-        if (r_is_objc_ptr(gOvCrossH)) {
-            OV_Rect h = {cx - 9.0, cy - 0.75, 18.0, 1.5};
-            ov_set_rect(gOvCrossH, "setFrame:", h);
+    int w = (int)(pw + 0.5), h = (int)(ph + 0.5);
+    if (w > 0 && h > 0 && (w != gOvFBW || h != gOvFBH || !gOvFB)) {
+        if (ov_fb_reserve(w, h)) {
+            gOvFBPixels = 0; gOvFBContext = 0; gOvFBImage = 0;   /* 让 ensure 重建 */
         }
-        if (r_is_objc_ptr(gOvCrossV)) {
-            OV_Rect v = {cx - 0.75, cy - 9.0, 1.5, 18.0};
-            ov_set_rect(gOvCrossV, "setFrame:", v);
-        }
-        gOvCrossCx = cx; gOvCrossCy = cy;
     }
+    if (r_is_objc_ptr(gOvFBView) &&
+        (gOvFBViewX != px || gOvFBViewY != py || gOvFBViewW != pw || gOvFBViewH != ph)) {
+        OV_Rect fr = {px, py, pw, ph};
+        ov_set_rect(gOvFBView, "setFrame:", fr);
+        gOvFBViewX = px; gOvFBViewY = py; gOvFBViewW = pw; gOvFBViewH = ph;
+    }
+    gOvCrossCx = sw / 2.0; gOvCrossCy = sh / 2.0;
 }
 
 /* 解析一行快照并更新方框。返回画出来的方框数。
@@ -659,126 +769,94 @@ static void ov_sync_geometry(void)
        人物直接用自身 z，不再额外加身高。 */
 static int ov_draw_snapshot(void)
 {
-    if (!r_is_objc_ptr(gOvWindow) || !gOvSnapFresh || !gOvSnap[0]) {
-        if (gOvCacheValid) {
-            for (int i = 0; i < gOvSlotsAllocated; i++) {
-                if (!gOvCache[i].hidden) {
-                    if (r_is_objc_ptr(gOvBox[i])) ov_set_bool(gOvBox[i], "setHidden:", 1);
-                    if (r_is_objc_ptr(gOvDist[i])) ov_set_bool(gOvDist[i], "setHidden:", 1);
-                    gOvCache[i].hidden = true;
-                }
-            }
-        }
-        return 0;
-    }
+    if (!r_is_objc_ptr(gOvWindow) || !r_is_objc_ptr(gOvFBView) || !gOvFB) return 0;
 
     double sw = 0, sh = 0;
     ov_screen_wh(&sw, &sh);
     if (sw < 8.0 || sh < 8.0) return 0;
     ov_sync_geometry();
-    /* 裁剪容器原点：全屏坐标减掉它才是容器内坐标 */
-    double ox = gOvClipX, oy = gOvClipY;
+    if (!ov_bitmap_ensure_target()) return 0;
 
-    /* 自己 */
-    char *p = gOvSnap;
-    double sx = 0, sy = 0, sz = 0, yaw = 0, pitch = 0;
-    if (sscanf(p, "%lf,%lf,%lf,%lf,%lf", &sx, &sy, &sz, &yaw, &pitch) != 5) return 0;
-    gOvLastSelf[0] = sx; gOvLastSelf[1] = sy; gOvLastSelf[2] = sz;
-    gOvLastYaw = yaw; gOvLastPitch = pitch;
-    OV_Vec3 cam = ov_ue_to_world(sx, sy, sz);
-    /* 眼高是"脚底往上"的量，而 z 是胶囊中心（脚底上方 0.9m），所以减去 0.9 */
-    cam.z += (gOvEye - 0.9);
+    double px = 0, py = 0, pw = 0, ph = 0;
+    ov_panel_rect(&px, &py, &pw, &ph);
+    if (gOvFullscreen) { px = 0; py = 0; pw = sw; ph = sh; }
 
-    double yr = -yaw * M_PI / 180.0;
-    double pr = pitch * M_PI / 180.0;
-    if (pr > 1.55) pr = 1.55;
-    if (pr < -1.55) pr = -1.55;
-    OV_Vec3 fwd = {cos(yr) * cos(pr), sin(yr) * cos(pr), sin(pr)};
-    OV_Vec3 up0 = {0, 0, 1};
-    OV_Vec3 right = ov_norm(ov_cross(fwd, up0));
-    OV_Vec3 up = ov_cross(right, fwd);
+    /* 整块清成透明（预乘 alpha：全 0 即透明） */
+    memset(gOvFB, 0, (size_t)gOvFBW * (size_t)gOvFBH * 4);
 
-    double tanHalfY = tan(gOvFov * M_PI / 360.0);
-    double aspect = sw / sh;
-
-    char *semi = strchr(gOvSnap, ';');
-    if (!semi) return 0;
-    p = semi + 1;
-
-    static bool used[OV_MAX_SLOTS];
-    memset(used, 0, sizeof(used));
+    /* 准星：屏幕正中（也就是面板正中），画进位图 */
+    if (gOvShowCross) {
+        double cx = sw / 2.0 - px, cy = sh / 2.0 - py;
+        ov_fb_rect(cx - 9.0, cy - 0.75, 18.0, 1.5, 0, 255, 0);
+        ov_fb_rect(cx - 0.75, cy - 9.0, 1.5, 18.0, 0, 255, 0);
+    }
 
     int drawn = 0;
-    char *save = NULL;
-    for (char *tok = strtok_r(p, ";", &save); tok && drawn < gOvSlotsAllocated; tok = strtok_r(NULL, ";", &save)) {
-        double ex = 0, ey = 0, ez = 0;
-        int kind = 0;
-        if (sscanf(tok, "%lf,%lf,%lf,%d", &ex, &ey, &ez, &kind) != 4) continue;
-        OV_Vec3 w = ov_ue_to_world(ex, ey, ez);       /* z 本身就是胶囊中心，不要再加身高 */
+    if (gOvSnapFresh && gOvSnap[0]) {
+        double sx = 0, sy = 0, sz = 0, yaw = 0, pitch = 0;
+        if (sscanf(gOvSnap, "%lf,%lf,%lf,%lf,%lf", &sx, &sy, &sz, &yaw, &pitch) == 5) {
+            gOvLastSelf[0] = sx; gOvLastSelf[1] = sy; gOvLastSelf[2] = sz;
+            gOvLastYaw = yaw; gOvLastPitch = pitch;
+            OV_Vec3 cam = ov_ue_to_world(sx, sy, sz);
+            cam.z += (gOvEye - 0.9);            /* z 是胶囊中心，眼高从脚底算 */
 
-        OV_Vec3 d = ov_sub(w, cam);
-        double depth = ov_dot(d, fwd);
-        if (depth < 0.5) continue;
-        double rx = ov_dot(d, right) / depth;
-        double ry = ov_dot(d, up) / depth;
-        if (fabs(rx) > tanHalfY * aspect * 1.6 || fabs(ry) > tanHalfY * 1.6) continue;
+            double yr = -yaw * M_PI / 180.0;
+            double pr = pitch * M_PI / 180.0;
+            if (pr > 1.55) pr = 1.55;
+            if (pr < -1.55) pr = -1.55;
+            OV_Vec3 fwd = {cos(yr) * cos(pr), sin(yr) * cos(pr), sin(pr)};
+            OV_Vec3 up0 = {0, 0, 1};
+            OV_Vec3 right = ov_norm(ov_cross(fwd, up0));
+            OV_Vec3 up = ov_cross(right, fwd);
 
-        /* 投影锚定屏幕正中：fov 是竖直视场角（与网页版 three.js 一致），
-           横竖两个方向都用 sh/2——横向若用 sw/2 会漏掉 aspect，画面被横向拉伸。
-           得到的是全屏坐标，setFrame 时再减掉裁剪容器原点 (ox,oy)。 */
-        double cx = sw / 2.0 + rx * (sh / 2.0) / tanHalfY;
-        double cy = sh / 2.0 - ry * (sh / 2.0) / tanHalfY;
+            double tanHalfY = tan(gOvFov * M_PI / 360.0);
+            double aspect = sw / sh;
 
-        double boxH = OV_PERSON_HEIGHT / depth * (sh / 2.0) / tanHalfY;
-        if (boxH < OV_MIN_BOX_PX) boxH = OV_MIN_BOX_PX;
-        double boxW = boxH * 0.52;
-        if (drawn == 0) { gOvLastCx = cx; gOvLastCy = cy; gOvLastDepth = depth; }
+            char *semi = strchr(gOvSnap, ';');
+            char *body = semi ? semi + 1 : NULL;
+            char *save = NULL;
+            for (char *tok = body ? strtok_r(body, ";", &save) : NULL;
+                 tok && drawn < gOvSlotsAllocated;
+                 tok = strtok_r(NULL, ";", &save)) {
+                double ex = 0, ey = 0, ez = 0;
+                int kind = 0;
+                if (sscanf(tok, "%lf,%lf,%lf,%d", &ex, &ey, &ez, &kind) != 4) continue;
+                OV_Vec3 w3 = ov_ue_to_world(ex, ey, ez);
 
-        int i = drawn++;
-        used[i] = true;
-        OV_Rect box = {cx - ox - boxW / 2.0, cy - oy - boxH / 2.0, boxW, boxH};
-        int distM = (int)(depth + 0.5);
+                OV_Vec3 d = ov_sub(w3, cam);
+                double depth = ov_dot(d, fwd);
+                if (depth < 0.5) continue;
+                double rx = ov_dot(d, right) / depth;
+                double ry = ov_dot(d, up) / depth;
+                if (fabs(rx) > tanHalfY * aspect * 1.6 || fabs(ry) > tanHalfY * 1.6) continue;
 
-        OV_SlotCache *c = &gOvCache[i];
-        /* 每格的上一次下发值：只有真的变了才发远程调用。远程调用极贵——标量 setter
-           在非 vphone 通道下走 NSInvocation，每次 13 个远程调用、每个调用还会 spawn
-           一个 pac 线程 + 异常端口。所以能省则省：
-             - 位置没变就不发 setFrame:；
-             - 已经可见就不再发 setHidden:0（重复发等于白跑 13 次远程调用）。 */
-        bool geomChanged = !gOvCacheValid || !c->used
-                           || fabs(c->r.x - box.x) > 0.5 || fabs(c->r.y - box.y) > 0.5
-                           || fabs(c->r.w - box.w) > 0.5 || fabs(c->r.h - box.h) > 0.5;
-        bool needShow = !gOvCacheValid || c->hidden || !c->used;
-        if (geomChanged) {
-            ov_set_rect(gOvBox[i], "setFrame:", box);
-            if (needShow) ov_set_bool(gOvBox[i], "setHidden:", 0);
-            if (r_is_objc_ptr(gOvDist[i])) {
-                OV_Rect dl = {cx - ox - 40.0, cy - oy + boxH / 2.0 + 2.0, 80.0, 14.0};
-                ov_set_rect(gOvDist[i], "setFrame:", dl);
-                bool wantDistHidden = gOvShowDist ? false : true;
-                bool distChangedVis = !gOvCacheValid || c->distHidden || !c->used;
-                if (distChangedVis || c->distHidden != wantDistHidden) {
-                    ov_set_bool(gOvDist[i], "setHidden:", wantDistHidden ? 1 : 0);
-                    c->distHidden = wantDistHidden;
+                /* 全屏坐标 → 位图坐标（减面板原点） */
+                double cx = sw / 2.0 + rx * (sh / 2.0) / tanHalfY - px;
+                double cy = sh / 2.0 - ry * (sh / 2.0) / tanHalfY - py;
+                double boxH = OV_PERSON_HEIGHT / depth * (sh / 2.0) / tanHalfY;
+                if (boxH < OV_MIN_BOX_PX) boxH = OV_MIN_BOX_PX;
+                double boxW = boxH * 0.52;
+                if (drawn == 0) { gOvLastCx = cx; gOvLastCy = cy; gOvLastDepth = depth; }
+                drawn++;
+
+                uint8_t r = 255, g = 64, b = 64;                 /* 敌人=红 */
+                if (kind == 1) { r = 64; g = 160; b = 255; }     /* 队友=蓝 */
+                else if (kind == 2) { r = 255; g = 176; b = 64; }/* AI=橙 */
+
+                double x0 = cx - boxW / 2.0, y0 = cy - boxH / 2.0, t = 2.0;
+                ov_fb_rect(x0, y0, boxW, t, r, g, b);
+                ov_fb_rect(x0, y0 + boxH - t, boxW, t, r, g, b);
+                ov_fb_rect(x0, y0, t, boxH, r, g, b);
+                ov_fb_rect(x0 + boxW - t, y0, t, boxH, r, g, b);
+                if (gOvShowDist) {
+                    ov_fb_text_m((int)(depth + 0.5), (int)(cx - 12), (int)(y0 + boxH + 2), 1,
+                                 255, 255, 255);
                 }
             }
         }
-        if (!gOvCacheValid || c->dist != distM) {
-            char buf[OV_NAME_TEXT_MAX];
-            snprintf(buf, sizeof(buf), "%dm", distM);
-            ov_set_text(gOvDist[i], buf);
-        }
-        c->used = true; c->hidden = false; c->r = box; c->dist = distM;
     }
 
-    for (int i = drawn; i < gOvSlotsAllocated; i++) {
-        OV_SlotCache *c = &gOvCache[i];
-        if (gOvCacheValid && (c->hidden || !c->used)) continue;
-        if (r_is_objc_ptr(gOvBox[i])) ov_set_bool(gOvBox[i], "setHidden:", 1);
-        if (r_is_objc_ptr(gOvDist[i])) ov_set_bool(gOvDist[i], "setHidden:", 1);
-        c->hidden = true; c->used = false; c->distHidden = true;
-    }
-    gOvCacheValid = true;
+    ov_bitmap_upload(gOvProc);
     return drawn;
 }
 
@@ -917,6 +995,7 @@ bool clock_overlay_failed(void) { return gOvFailed; }
 bool clock_overlay_start(RemoteCall *proc)
 {
     if (!proc) { ov_status("RemoteCall 为空：请先在首页初始化远程调用"); return false; }
+    gOvProc = proc;                 /* 提交像素要用它（remote_write） */
     ov_crumb_install();
 
     pthread_mutex_lock(&gOvLock);
