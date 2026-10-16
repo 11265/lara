@@ -254,39 +254,44 @@ static void ov_panel_rect(double *px, double *py, double *pw, double *ph)
 }
 
 static uint64_t ov_make_view(uint64_t clsUIView, uint64_t clearColor, double borderWidth,
-                             uint64_t borderColor, OV_Rect frame)
+                             uint64_t borderColor, OV_Rect frame, bool trace)
 {
     uint64_t alloc = r_msg2_main(clsUIView, "alloc", 0, 0, 0, 0);
-    uint64_t v = r_is_objc_ptr(alloc) ? r_msg2_main(alloc, "init", 0, 0, 0, 0) : 0;
-    if (!r_is_objc_ptr(v)) return 0;
+    if (!r_is_objc_ptr(alloc)) { if (trace) printf("(overlay)   alloc 失败 0x%llx\n", alloc); return 0; }
+    uint64_t v = r_msg2_main(alloc, "init", 0, 0, 0, 0);
+    if (!r_is_objc_ptr(v)) { if (trace) printf("(overlay)   init 失败 0x%llx\n", v); return 0; }
+    if (trace) printf("(overlay)   view=0x%llx\n", v);
     if (r_is_objc_ptr(clearColor)) r_msg2_main(v, "setBackgroundColor:", clearColor, 0, 0, 0);
-    ov_set_bool(v, "setUserInteractionEnabled:", 0);
     if (borderWidth > 0.0) {
         uint64_t ly = r_msg2_main(v, "layer", 0, 0, 0, 0);
+        if (trace) printf("(overlay)   layer=0x%llx border=0x%llx\n", ly, borderColor);
         if (r_is_objc_ptr(ly)) {
             ov_set_double(ly, "setBorderWidth:", borderWidth);
+            /* borderColor 必须是 CGColorRef（CFTypeRef），传 UIColor 会让目标 trap */
             if (r_is_objc_ptr(borderColor)) r_msg2_main(ly, "setBorderColor:", borderColor, 0, 0, 0);
         }
     }
+    /* 标量一律走对象形态（与 peace_esp 一致，真机验证过；raw 形态在部分调用上会崩） */
+    r_msg2_main(v, "setHidden:", 1, 0, 0, 0);
     ov_set_rect(v, "setFrame:", frame);
-    ov_set_bool(v, "setHidden:", 1);
     return v;
 }
 
 static uint64_t ov_make_label(uint64_t clsUILabel, uint64_t font, uint64_t textColor,
-                              uint64_t clearColor, int align, OV_Rect frame)
+                              uint64_t clearColor, int align, OV_Rect frame, bool trace)
 {
     uint64_t alloc = r_msg2_main(clsUILabel, "alloc", 0, 0, 0, 0);
-    uint64_t lb = r_is_objc_ptr(alloc) ? r_msg2_main(alloc, "init", 0, 0, 0, 0) : 0;
-    if (!r_is_objc_ptr(lb)) return 0;
+    if (!r_is_objc_ptr(alloc)) { if (trace) printf("(overlay)   label alloc 失败 0x%llx\n", alloc); return 0; }
+    uint64_t lb = r_msg2_main(alloc, "init", 0, 0, 0, 0);
+    if (!r_is_objc_ptr(lb)) { if (trace) printf("(overlay)   label init 失败 0x%llx\n", lb); return 0; }
+    if (trace) printf("(overlay)   label=0x%llx font=0x%llx color=0x%llx\n", lb, font, textColor);
     if (r_is_objc_ptr(font)) r_msg2_main(lb, "setFont:", font, 0, 0, 0);
     if (r_is_objc_ptr(textColor)) r_msg2_main(lb, "setTextColor:", textColor, 0, 0, 0);
     if (r_is_objc_ptr(clearColor)) r_msg2_main(lb, "setBackgroundColor:", clearColor, 0, 0, 0);
-    ov_set_int(lb, "setTextAlignment:", align);
-    ov_set_int(lb, "setNumberOfLines:", 1);
-    ov_set_bool(lb, "setUserInteractionEnabled:", 0);
+    r_msg2_main(lb, "setTextAlignment:", (uint64_t)align, 0, 0, 0);
+    r_msg2_main(lb, "setNumberOfLines:", 1, 0, 0, 0);
+    r_msg2_main(lb, "setHidden:", 1, 0, 0, 0);
     ov_set_rect(lb, "setFrame:", frame);
-    ov_set_bool(lb, "setHidden:", 1);
     return lb;
 }
 
@@ -370,7 +375,7 @@ static bool ov_build(RemoteCall *proc)
     if (slots > OV_MAX_SLOTS) slots = OV_MAX_SLOTS;
     for (int i = 0; i < slots; i++) {
         OV_Rect r0 = {0, 0, 0, 0};
-        uint64_t box = ov_make_view(clsView, clear, 2.0, redCG, r0);
+        uint64_t box = ov_make_view(clsView, clear, 2.0, redCG, r0, i == 0);
         if (!r_is_objc_ptr(box)) {
             ov_status("[5/6] 第 %d 个方框创建失败（box=0x%llx）", i, box);
             return false;
@@ -379,7 +384,7 @@ static bool ov_build(RemoteCall *proc)
         gOvBox[i] = box;
 
         OV_Rect r2 = {0, 0, 0, 0};
-        uint64_t ds = ov_make_label(clsLabel, font, white, clear, 1, r2);
+        uint64_t ds = ov_make_label(clsLabel, font, white, clear, 1, r2, i == 0);
         if (!r_is_objc_ptr(ds)) {
             ov_status("[5/6] 第 %d 个文字创建失败（label=0x%llx）", i, ds);
             return false;
@@ -396,8 +401,8 @@ static bool ov_build(RemoteCall *proc)
         double cx = pw / 2.0, cy = ph / 2.0;
         OV_Rect h = {cx - 9.0, cy - 0.75, 18.0, 1.5};
         OV_Rect v = {cx - 0.75, cy - 9.0, 1.5, 18.0};
-        gOvCrossH = ov_make_view(clsView, white, 0.0, 0, h);
-        gOvCrossV = ov_make_view(clsView, white, 0.0, 0, v);
+        gOvCrossH = ov_make_view(clsView, white, 0.0, 0, h, false);
+        gOvCrossV = ov_make_view(clsView, white, 0.0, 0, v, false);
         if (r_is_objc_ptr(gOvCrossH)) r_msg2_main(win, "addSubview:", gOvCrossH, 0, 0, 0);
         if (r_is_objc_ptr(gOvCrossV)) r_msg2_main(win, "addSubview:", gOvCrossV, 0, 0, 0);
         ov_set_bool(gOvCrossH, "setHidden:", gOvShowCross ? 0 : 1);
