@@ -257,7 +257,7 @@ bool clock_overlay_start(RemoteCall *proc)
         return false;
     }
 
-    uint64_t allocatedWindow = RemoteArbCall(proc, objc_alloc, clsUIWindow);
+    uint64_t allocatedWindow = remote_msg(proc, clsUIWindow, remote_sel(proc, "alloc"), 0, 0, 0, 0);
     uint64_t window = allocatedWindow
         ? remote_msg(proc, allocatedWindow, remote_sel(proc, "initWithWindowScene:"), scene, 0, 0, 0)
         : 0;
@@ -293,7 +293,7 @@ bool clock_overlay_start(RemoteCall *proc)
     clock_set_rect(proc, window, remote_sel(proc, "setFrame:"), screenRect);
     remote_msg(proc, window, remote_sel(proc, "setHidden:"), 1, 0, 0, 0);
 
-    uint64_t allocatedLabel = RemoteArbCall(proc, objc_alloc, clsUILabel);
+    uint64_t allocatedLabel = remote_msg(proc, clsUILabel, remote_sel(proc, "alloc"), 0, 0, 0, 0);
     uint64_t label = allocatedLabel ? remote_msg(proc, allocatedLabel, remote_sel(proc, "init"), 0, 0, 0, 0) : 0;
     if (!label) {
         pthread_mutex_unlock(&gClockLock);
