@@ -21,7 +21,6 @@
 #import "clock_overlay.h"
 
 long findcachedataoff(const char *mgkey);
-void LaraClearIconCache(void);
 
 @interface UIDevice(Private)
 + (BOOL)_hasHomeButton;
