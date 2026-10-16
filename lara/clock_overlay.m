@@ -759,8 +759,17 @@ static void ov_tick(void)
 static void ov_start_timer(RemoteCall *proc)
 {
     if (gOvTimer) return;
-    dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
-                                                 dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0));
+    /* 必须用**串行队列**：一帧里每个标量 setter 在非 vphone 通道下要走 NSInvocation，
+       十几个远程调用、还各自 sleep，整帧可能几百毫秒。挂在并发全局队列上时，10Hz 的
+       定时器会把好几帧同时排进来并发去跑，远程调用瞬间扎堆——真机日志里"连续密集远程
+       调用到 ~19 次目标就崩"，扎堆正是 SpringBoard 裸崩（PC=0x401）的直接来源。
+       串行队列保证同一时刻只有一帧在跑，错过的帧自动合并。 */
+    static dispatch_queue_t q;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        q = dispatch_queue_create("lara.overlay.tick", DISPATCH_QUEUE_SERIAL);
+    });
+    dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
     if (!t) { printf("(overlay) 定时器创建失败\n"); fflush(stdout); return; }
     dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, 0),
                               OV_TICK_MS * NSEC_PER_MSEC, 2 * NSEC_PER_MSEC);

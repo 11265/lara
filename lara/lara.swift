@@ -113,25 +113,17 @@ struct lara: App {
     private func handlebg() {
         guard mgr.rcready else { return }
 
-        // 悬浮第一视角由 lara 进程驱动，切到后台时不能销毁远程调用
-        if mgr.clockrunning {
-            globallogger.log("(fpv) 后台保留远程调用以维持悬浮第一视角")
-            return
-        }
-
-        let keepSpringBoardRemoteCallAlive = UserDefaults.standard.bool(forKey: "keepSpringBoardRemoteCallAliveIOS16")
-        if isIOS16() && keepSpringBoardRemoteCallAlive {
-            return
-        }
-
-        var bgTask: UIBackgroundTaskIdentifier = .invalid
-
-        bgTask = UIApplication.shared.beginBackgroundTask(withName: "RemoteCallCleanup") {
-            endbgtask(&bgTask)
-        }
-
-        mgr.rcdestroy {
-            self.endbgtask(&bgTask)
+        // 关键：SpringBoard 里的远程会话靠 lara 进程持续应答。lara 一旦被系统挂起，
+        // 或者这个会话被拆掉，SpringBoard 里挂着的木马线程就没人应答、裸崩在
+        // PC=0x401，于是**整个 SpringBoard 重开**——也就是"返回桌面就崩溃"。
+        // 所以切后台【绝不拆会话】，改为打开后台保活（播放静音、走 audio 后台模式），
+        // 让 lara 留在后台继续应答；浮层本来也要求 lara 活着才能更新。
+        if !kaenabled {
+            toggleka()
+            UserDefaults.standard.set(true, forKey: "keepAlive")
+            globallogger.log("(ka) 后台保活已开启：维持 SpringBoard 远程会话，不拆会话")
+        } else {
+            globallogger.log("(fpv) 后台保留远程会话（保活中）")
         }
     }
 
