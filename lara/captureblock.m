@@ -1,8 +1,8 @@
 //
-//  screenshotblock.m
+//  captureblock.m
 //  lara
 //
-//  Device-wide screenshot / screen-recording block.
+//  Device-wide screenshot / screen-recording block (implements screenshotblock.h).
 //
 //  While lara has a live SpringBoard remote call, this finds SpringBoard's own
 //  capture services and replaces their capture actions with a side-effect-free
@@ -37,14 +37,14 @@
 
 /* Class-name fragments that mark a capture-related class. */
 static const char *kCapClassKeywords[] = {
-    "creenshot", "Screenshot", "creencapture", "ScreenCapture",
+    "creenshot", "creencapture", "ScreenCapture",
     "ecording", "Recording", "creenrecord", "ScreenRecord",
 };
 #define CAP_CLASS_KEYWORD_COUNT (sizeof(kCapClassKeywords) / sizeof(kCapClassKeywords[0]))
 
 /* Selector fragments that mark a capture action. */
 static const char *kCapActionKeywords[] = {
-    "creenshot", "Screenshot", "creencapture", "ScreenCapture", "aptureScreen",
+    "creenshot", "creencapture", "ScreenCapture", "aptureScreen",
     "ecord", "Record", "irror",
 };
 #define CAP_ACTION_KEYWORD_COUNT (sizeof(kCapActionKeywords) / sizeof(kCapActionKeywords[0]))
@@ -60,7 +60,7 @@ static const char *kCapSkipKeywords[] = {
 #pragma mark - State
 
 typedef struct {
-    uint64_t method;            /* Method in SpringBoard */
+    uint64_t method;            /* Method inside SpringBoard */
     uint64_t originalImp;
     char     selector[CAP_NAME_MAX];
 } CapPatch;
@@ -68,7 +68,7 @@ typedef struct {
 static CapPatch gCapPatches[CAP_MAX_PATCHED];
 static int      gCapPatchCount = 0;
 static uint64_t gCapNoopImp = 0;
-static char     gCapStatus[CAP_STATUS_MAX] = "未启�?;
+static char     gCapStatus[CAP_STATUS_MAX] = "not enabled";
 
 static bool cap_ptr(uint64_t p)
 {
@@ -105,12 +105,13 @@ static bool cap_contains_any(const char *haystack, const char **needles, size_t 
     return false;
 }
 
-/* Reads a NUL terminated C string out of the target, with a sanity check. */
+/* Reads a NUL terminated C string out of the target, with a printable-ASCII
+   sanity check so a wrong address cannot be mistaken for a name. */
 static bool cap_read_cstring(RemoteCall *proc, uint64_t addr, char *out, size_t outLen)
 {
     if (!out || outLen == 0) return false;
     out[0] = '\0';
-    if (addr < 0x100000000ULL) return false;
+    if (!cap_ptr(addr)) return false;
     if (![proc remoteRead:addr to:out size:outLen - 1]) return false;
     out[outLen - 1] = '\0';
     if (out[0] == '\0') return false;
@@ -122,20 +123,20 @@ static bool cap_read_cstring(RemoteCall *proc, uint64_t addr, char *out, size_t 
 }
 
 /* method_t is { SEL name; const char *types; IMP imp; } on absolute method
-   lists, which is what the Apple runtimes use here; relative lists give small
+   lists, which is what the Apple runtime uses here; relative lists put small
    integers in the first slot, and then we fall back to the runtime accessors. */
 static bool cap_method_is_absolute_layout(RemoteCall *proc, uint64_t method, uint64_t *nameAddr)
 {
     uint64_t raw = 0;
     if (![proc remoteRead:method to:&raw size:sizeof(raw)]) return false;
-    if (raw < 0x100000000ULL) return false;          /* looks like an offset, not a pointer */
+    if (!cap_ptr(raw)) return false;                 /* looks like an offset, not a pointer */
     char probe[8] = {0};
     if (![proc remoteRead:raw to:probe size:sizeof(probe) - 1]) return false;
+    if (probe[0] == '\0') return false;
     for (int i = 0; i < 7 && probe[i]; i++) {
         unsigned char c = (unsigned char)probe[i];
         if (c < 0x20 || c > 0x7e) return false;
     }
-    if (probe[0] == '\0') return false;
     if (nameAddr) *nameAddr = raw;
     return true;
 }
@@ -152,7 +153,7 @@ static int cap_process_class(RemoteCall *proc, uint64_t cls, const char *classNa
     RemoteArbCall(proc, free, countPtr);
     if (!list) return 0;
 
-    cap_note("�?%s�?u 个方�?, className, count);
+    cap_note("class %s: %u methods", className, count);
 
     int patched = 0;
     for (uint32_t i = 0; i < count; i++) {
@@ -175,54 +176,56 @@ static int cap_process_class(RemoteCall *proc, uint64_t cls, const char *classNa
 
         if (!cap_contains_any(selector, kCapActionKeywords, CAP_ACTION_KEYWORD_COUNT)) continue;
 
-        cap_note("候�?%s", selector);
+        cap_note("candidate %s", selector);
 
         if (cap_contains_any(selector, kCapSkipKeywords, CAP_SKIP_KEYWORD_COUNT)) {
-            cap_note("  跳过：装�?通知/界面");
+            cap_note("  skip: wiring/UI, not the action");
             continue;
         }
 
         if (gCapPatchCount + patched >= CAP_MAX_PATCHED) {
-            cap_note("  跳过：已达上�?%d", CAP_MAX_PATCHED);
+            cap_note("  skip: patch limit %d reached", CAP_MAX_PATCHED);
             continue;
         }
 
-        /* Type encoding: 'v' at offset 0 means the method returns void, which is
-           the only shape we can replace with a do-nothing implementation without
-           risking a bogus return value. */
+        /* Type encoding: 'v' first means the method returns void, the only shape
+           we can replace with a do-nothing implementation safely. */
         char encoding[32] = {0};
-        uint64_t encodingAddr = 0;
-        if (nameAddr && [proc remoteRead:method + 8 to:&encodingAddr size:sizeof(encodingAddr)]) {
-            cap_read_cstring(proc, encodingAddr, encoding, sizeof(encoding));
+        if (nameAddr) {
+            uint64_t encodingAddr = 0;
+            if ([proc remoteRead:method + 8 to:&encodingAddr size:sizeof(encodingAddr)]) {
+                cap_read_cstring(proc, encodingAddr, encoding, sizeof(encoding));
+            }
         }
         if (encoding[0] == '\0') {
             uint64_t encPtr = RemoteArbCall(proc, method_getTypeEncoding, method);
             if (encPtr) [proc remoteRead:encPtr to:encoding size:sizeof(encoding) - 1];
         }
         if (encoding[0] != 'v') {
-            cap_note("  跳过：返回类�?'%c'（非 void），需要单独处�?, encoding[0] ? encoding[0] : '?');
+            cap_note("  skip: returns '%c', needs its own handling", encoding[0] ? encoding[0] : '?');
             continue;
         }
 
-        /* Neutralise: remember the old IMP, then point it at a function that only
-           returns (here: -[NSObject class], harmless and argument free). */
+        /* Neutralise: remember the old IMP, then point the method at a function
+           that only returns (-[NSObject class]). */
         uint64_t originalImp = RemoteArbCall(proc, method_getImplementation, method);
         int slot = gCapPatchCount + patched;
         gCapPatches[slot].method = method;
         gCapPatches[slot].originalImp = originalImp;
         strncpy(gCapPatches[slot].selector, selector, sizeof(gCapPatches[slot].selector) - 1);
+        gCapPatches[slot].selector[sizeof(gCapPatches[slot].selector) - 1] = '\0';
 
+        bool wrote = false;
         if (nameAddr) {
-            /* Absolute layout: the IMP slot is the third field, a plain write. */
-            if (![proc remote_write64:method + 16 value:gCapNoopImp]) {
-                RemoteArbCall(proc, method_setImplementation, method, gCapNoopImp);
-            }
-        } else {
+            /* Absolute layout: the IMP is the third field, so a plain write. */
+            wrote = [proc remote_write64:method + 16 value:gCapNoopImp];
+        }
+        if (!wrote) {
             RemoteArbCall(proc, method_setImplementation, method, gCapNoopImp);
         }
 
         patched++;
-        cap_note("  �?已置空（截屏/录屏将被吞掉�?);
+        cap_note("  -> neutralised (screenshot/recording will be swallowed)");
     }
 
     RemoteArbCall(proc, free, list);
@@ -235,7 +238,7 @@ static int cap_process_class(RemoteCall *proc, uint64_t cls, const char *classNa
 int sb_capture_block_apply(RemoteCall *proc)
 {
     if (!proc) {
-        cap_status("失败：RemoteCall 为空");
+        cap_status("failed: no RemoteCall");
         return 0;
     }
 
@@ -247,14 +250,14 @@ int sb_capture_block_apply(RemoteCall *proc)
         if (m) gCapNoopImp = RemoteArbCall(proc, method_getImplementation, m);
     }
     if (!gCapNoopImp) {
-        cap_status("失败：拿不到空实�?);
+        cap_status("failed: no neutral implementation available");
         return 0;
     }
 
-    printf("(capblock) === 运行时禁止录�?截屏：开始枚�?SpringBoard 捕获服务 ===\n");
+    printf("(capblock) === blocking screenshots and screen recording ===\n");
     fflush(stdout);
 
-    /* Enumerate the class names of the SpringBoard image by reading memory. */
+    /* Class names of the SpringBoard image, read out of the target. */
     const char *image = "/System/Library/CoreServices/SpringBoard.app/SpringBoard";
     uint64_t imageBuf = remote_alloc_str(proc, image);
     uint64_t countPtr = imageBuf ? RemoteArbCall(proc, malloc, (uint64_t)sizeof(uint32_t)) : 0;
@@ -264,9 +267,10 @@ int sb_capture_block_apply(RemoteCall *proc)
         names = RemoteArbCall(proc, objc_copyClassNamesForImage, imageBuf, countPtr);
         if (names) [proc remoteRead:countPtr to:&classCount size:sizeof(classCount)];
     }
-    cap_note("SpringBoard 类数量：%u（names=0x%llx�?, classCount, names);
+    cap_note("SpringBoard classes: %u (names=0x%llx)", classCount, names);
+
     if (!names) {
-        cap_status("枚举失败：拿不到 SpringBoard 的类列表");
+        cap_status("failed: could not read SpringBoard's class list");
         if (countPtr) RemoteArbCall(proc, free, countPtr);
         if (imageBuf) RemoteArbCall(proc, free, imageBuf);
         return 0;
@@ -292,7 +296,7 @@ int sb_capture_block_apply(RemoteCall *proc)
     if (countPtr) RemoteArbCall(proc, free, countPtr);
     if (imageBuf) RemoteArbCall(proc, free, imageBuf);
 
-    cap_status("匹配�?%d 个捕获相关类，已置空 %d 个动作方法（原实现已保留，可还原�?,
+    cap_status("matched %d capture classes, neutralised %d action methods (originals kept, revertible)",
                classesMatched, gCapPatchCount);
     return gCapPatchCount;
 }
@@ -305,12 +309,12 @@ void sb_capture_block_revert(RemoteCall *proc)
     for (int i = 0; i < gCapPatchCount; i++) {
         if (!gCapPatches[i].method) continue;
         RemoteArbCall(proc, method_setImplementation, gCapPatches[i].method, gCapPatches[i].originalImp);
-        cap_note("还原 %s", gCapPatches[i].selector);
+        cap_note("restored %s", gCapPatches[i].selector);
         restored++;
     }
     memset(gCapPatches, 0, sizeof(gCapPatches));
     gCapPatchCount = 0;
-    cap_status("已还�?%d 个方法，截屏/录屏恢复正常", restored);
+    cap_status("restored %d methods, capture works again", restored);
 }
 
 bool sb_capture_block_active(void)
