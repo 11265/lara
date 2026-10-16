@@ -4,7 +4,9 @@
 //
 //  A purely cosmetic global overlay: a floating pill that shows the device's
 //  own local time, drawn by the target process (SpringBoard) so it floats
-//  above everything.
+//  above everything. The pill is hosted in a secure text field (and, where the
+//  window supports it, behind the private capture switch), so it is excluded
+//  from screenshots and screen recordings.
 //
 //  Data source: nothing but the host process' NSDate. It never reads memory,
 //  other processes, or any app's state.

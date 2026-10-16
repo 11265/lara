@@ -41,7 +41,7 @@ struct ClockView: View {
             } header: {
                 Text("悬浮时钟")
             } footer: {
-                Text("时间胶囊画在 SpringBoard 上，会浮在应用之上；退出 lara 后停止。自检会把 [1/8]…[8/8] 每一步写进日志，哪一步失败日志就停在哪一步。")
+                Text("时间胶囊画在 SpringBoard 上，会浮在应用之上；退出 lara 后停止。胶囊放在开启 secureTextEntry 的安全输入层里，因此不会出现在截图与录屏中（可截图自查：那个位置应是空的）。自检会把 [1/9]…[9/9] 每一步写进日志，哪一步失败日志就停在哪一步。")
             }
 
             if !mgr.clockstatus.isEmpty {
