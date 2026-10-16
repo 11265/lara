@@ -116,36 +116,57 @@ static double gOvHeightRatio = 0.0;
 static int gOvLandscape = 1;          /* 默认横屏（用户手选） */
 static int gOvFullscreen = 0;
 
+/* 静音期间保留的真实日志 fd：ov_log_mute 期间 ov_status 仍能写出去，
+   保证建层进度可见（被静音的只是远程调用那堆 (rc)/(pac) 刷屏）。 */
+static int gOvLogFd = -1;
+
 static void ov_status(const char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(gOvStatus, sizeof(gOvStatus), fmt, ap);
     va_end(ap);
-    printf("(overlay) %s\n", gOvStatus);
-    fflush(stdout);
+    if (gOvLogFd >= 0) {
+        dprintf(gOvLogFd, "(overlay) %s\n", gOvStatus);
+    } else {
+        printf("(overlay) %s\n", gOvStatus);
+        fflush(stdout);
+    }
 }
 
 /* 帧内更新期间把 stdout 静音：远程调用每次都打印十几行 (rc)/(pac)，
-   30Hz × 几十次调用会把日志刷爆。dup2 到 /dev/null，更新完恢复。 */
+   30Hz × 几十次调用会把日志刷爆（Logger 逐块 fsync，管道写满后 printf 会直接阻塞）。
+   dup2 到 /dev/null，更新完恢复；期间保留一个真实 fd 给 ov_status。 */
 static int gOvSavedStdout = -1;
+static int gOvSavedStderr = -1;
 static void ov_log_mute(void)
 {
     fflush(stdout);
+    fflush(stderr);
     if (gOvSavedStdout >= 0) return;
     int devnull = open("/dev/null", O_WRONLY);
     if (devnull < 0) return;
     gOvSavedStdout = dup(STDOUT_FILENO);
+    gOvSavedStderr = dup(STDERR_FILENO);
+    if (gOvLogFd < 0) gOvLogFd = dup(STDOUT_FILENO);
     dup2(devnull, STDOUT_FILENO);
+    dup2(devnull, STDERR_FILENO);       /* NSLog 走 stderr，同样要静音 */
     close(devnull);
 }
 static void ov_log_unmute(void)
 {
     if (gOvSavedStdout < 0) return;
     fflush(stdout);
+    fflush(stderr);
     dup2(gOvSavedStdout, STDOUT_FILENO);
     close(gOvSavedStdout);
     gOvSavedStdout = -1;
+    if (gOvSavedStderr >= 0) {
+        dup2(gOvSavedStderr, STDERR_FILENO);
+        close(gOvSavedStderr);
+        gOvSavedStderr = -1;
+    }
+    if (gOvLogFd >= 0) { close(gOvLogFd); gOvLogFd = -1; }
 }
 
 #pragma mark - 远程调用小工具（标量必须按字节传）
@@ -731,10 +752,12 @@ static void ov_start_timer(RemoteCall *proc)
 
 #pragma mark - Public API
 
+/* 下面这些 set_* 都由**主线程**的 SwiftUI 调用，一律不加锁：
+   它们只是写几个独立标量，绘图线程下一帧顺手读走即可。
+   一旦加锁，只要绘图线程/建层线程那一刻正持锁，主线程就会卡住 → watchdog。 */
 void clock_overlay_set_view(int maxSlots, double fovDeg, double eyeHeight,
                             int showNames, int showDist, int showCross)
 {
-    pthread_mutex_lock(&gOvLock);
     if (maxSlots > 0) gOvMaxSlots = (maxSlots > OV_MAX_SLOTS) ? OV_MAX_SLOTS : maxSlots;
     if (fovDeg >= 40.0 && fovDeg <= 130.0) gOvFov = fovDeg;
     if (eyeHeight >= 0.2 && eyeHeight <= 3.0) gOvEye = eyeHeight;
@@ -742,33 +765,26 @@ void clock_overlay_set_view(int maxSlots, double fovDeg, double eyeHeight,
     gOvShowDist = showDist ? 1 : 0;
     gOvShowCross = showCross ? 1 : 0;
     gOvCacheValid = false;          /* 画面参数变了：下一帧重发 */
-    pthread_mutex_unlock(&gOvLock);
 }
 
 void clock_overlay_set_geometry(double widthRatio, double topMargin)
 {
-    pthread_mutex_lock(&gOvLock);
     gOvWidthRatio = (widthRatio >= 0.2 && widthRatio <= 1.0) ? widthRatio : 0.92;
     gOvTop = (topMargin >= 0.0 && topMargin <= 600.0) ? topMargin : 56.0;
     gOvCacheValid = false;
-    pthread_mutex_unlock(&gOvLock);
 }
 
 void clock_overlay_set_height_ratio(double heightRatio)
 {
-    pthread_mutex_lock(&gOvLock);
     gOvHeightRatio = (heightRatio >= 0.1 && heightRatio <= 1.0) ? heightRatio : 0.0;
     gOvCacheValid = false;
-    pthread_mutex_unlock(&gOvLock);
 }
 
 void clock_overlay_set_layout(int landscape, int fullscreen)
 {
-    pthread_mutex_lock(&gOvLock);
     gOvLandscape = landscape ? 1 : 0;
     gOvFullscreen = fullscreen ? 1 : 0;
     gOvCacheValid = false;
-    pthread_mutex_unlock(&gOvLock);
 }
 
 void clock_overlay_set_snapshot(const char *compact)
@@ -787,10 +803,8 @@ void clock_overlay_set_snapshot(const char *compact)
 
 void clock_overlay_set_url(const char *url)
 {
-    pthread_mutex_lock(&gOvLock);
     if (!url) gOvUrl[0] = '\0';
     else { strncpy(gOvUrl, url, sizeof(gOvUrl) - 1); gOvUrl[sizeof(gOvUrl) - 1] = '\0'; }
-    pthread_mutex_unlock(&gOvLock);
 }
 
 const char *clock_overlay_url(void) { return gOvUrl; }
@@ -832,15 +846,25 @@ bool clock_overlay_start(RemoteCall *proc)
         }
     }
 
+    pthread_mutex_lock(&gOvLock);
     gOvWindow = 0;
     gOvClip = 0;
     gOvClipX = gOvClipY = gOvClipW = gOvClipH = -1;
     gOvCrossCx = gOvCrossCy = -1;
     for (int i = 0; i < OV_MAX_SLOTS; i++) { gOvBox[i] = gOvName[i] = gOvDist[i] = 0; }
     gOvSlotsAllocated = 0;
+    pthread_mutex_unlock(&gOvLock);
+
+    /* 建层：**不持锁**。ov_build 要做几十次跨进程调用（单次最长 R_TIMEOUT=5s），
+       每次还会往 stdout 打十几行；如果持锁，主线程任一 set_* 调用都会被拖住，
+       超过 ~10s 就被系统 watchdog 杀掉（crashes 里就是 EXC_CRASH/SIGKILL、
+       scene-update 10s / 0x8BADF00D，主线程卡在 gOvLock）。
+       同时把 stdout 静音：那波刷屏会把 Logger 的管道写满，之后 printf 直接阻塞。 */
+    ov_log_mute();
+    bool ok = ov_build(proc);
+    ov_log_unmute();
 
     pthread_mutex_lock(&gOvLock);
-    bool ok = ov_build(proc);
     gOvBuilding = false;
     if (!ok) gOvFailed = true;
     if (ok) { gOvRunning = true; ov_start_timer(proc); }
@@ -852,11 +876,13 @@ bool clock_overlay_selftest(RemoteCall *proc)
 {
     if (!proc) { ov_status("自检失败：RemoteCall 为空"); return false; }
 
-    pthread_mutex_lock(&gOvLock);
     gOvRunning = false;
     gOvFailed = false;                       /* 用户显式重试：解开失败闩锁 */
     if (gOvTimer) { dispatch_source_cancel(gOvTimer); gOvTimer = nil; }
-    if (r_is_objc_ptr(gOvWindow)) ov_set_bool(gOvWindow, "setHidden:", 1);
+    uint64_t win = gOvWindow;
+    if (r_is_objc_ptr(win)) ov_set_bool(win, "setHidden:", 1);   /* 远程调用放在锁外 */
+
+    pthread_mutex_lock(&gOvLock);
     gOvWindow = 0;
     gOvClip = 0;
     gOvClipX = gOvClipY = gOvClipW = gOvClipH = -1;
@@ -874,12 +900,11 @@ bool clock_overlay_selftest(RemoteCall *proc)
 void clock_overlay_stop(RemoteCall *proc)
 {
     (void)proc;
-    pthread_mutex_lock(&gOvLock);
-    gOvRunning = false;
+    gOvRunning = false;                       /* 先落标志：绘图线程下一帧就停 */
+    uint64_t win = gOvWindow;
     if (gOvTimer) { dispatch_source_cancel(gOvTimer); gOvTimer = nil; }
-    if (r_is_objc_ptr(gOvWindow)) ov_set_bool(gOvWindow, "setHidden:", 1);
+    if (r_is_objc_ptr(win)) ov_set_bool(win, "setHidden:", 1);
     ov_status("已隐藏（对象保留，可直接再次开启）");
-    pthread_mutex_unlock(&gOvLock);
 }
 
 void clock_overlay_unbind(void)
