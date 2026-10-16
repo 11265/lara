@@ -135,6 +135,71 @@ static void ov_status(const char *fmt, ...)
     }
 }
 
+/* ── 崩溃面包屑 ──────────────────────────────────────────────────────────
+   真机上 lara 崩得太频繁时内核尸体槽会满（Corpse failure, too many），
+   崩溃报告写不出来，日志只会戛然而止，永远看不到死在哪一步。
+   所以自己落一个文件：每个关键步骤写一行并 fsync；信号处理器再把
+   "最后一步"补写一遍（处理器里不做格式化，只 write 预先存好的那一行）。 */
+static int gOvCrumbFd = -1;
+static char gOvCrumbPath[512];
+static volatile char gOvCrumbLast[192] = "启动前";
+
+static void ov_crumb_open(void)
+{
+    if (gOvCrumbFd >= 0) return;
+    const char *home = getenv("HOME");
+    snprintf(gOvCrumbPath, sizeof(gOvCrumbPath), "%s/Documents/fpv-crumb.log",
+             home ? home : "/tmp");
+    gOvCrumbFd = open(gOvCrumbPath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+}
+
+static void ov_crumb(const char *fmt, ...)
+{
+    ov_crumb_open();
+    if (gOvCrumbFd < 0) return;
+    char buf[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    size_t n = strlen(buf);
+    if (n > sizeof(gOvCrumbLast) - 1) n = sizeof(gOvCrumbLast) - 1;
+    memcpy((void *)gOvCrumbLast, buf, n);
+    ((char *)gOvCrumbLast)[n] = '\0';
+    write(gOvCrumbFd, buf, n);
+    fsync(gOvCrumbFd);
+}
+
+static void ov_crumb_signal(int sig)
+{
+    if (gOvCrumbFd >= 0) {
+        char num[4];
+        int k = 0;
+        if (sig >= 10) num[k++] = (char)('0' + (sig / 10) % 10);
+        num[k++] = (char)('0' + sig % 10);
+        write(gOvCrumbFd, "*** 信号 ", 11);
+        write(gOvCrumbFd, num, (size_t)k);
+        write(gOvCrumbFd, " 死前最后一步：", 21);
+        write(gOvCrumbFd, (const char *)gOvCrumbLast, strlen((const char *)gOvCrumbLast));
+        write(gOvCrumbFd, "\n", 1);
+        fsync(gOvCrumbFd);
+    }
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void ov_crumb_install(void)
+{
+    ov_crumb_open();
+    ov_crumb("== 浮层启动，面包屑已开启 ==\n");
+    signal(SIGSEGV, ov_crumb_signal);
+    signal(SIGBUS, ov_crumb_signal);
+    signal(SIGABRT, ov_crumb_signal);
+    signal(SIGILL, ov_crumb_signal);
+    signal(SIGFPE, ov_crumb_signal);
+    ov_crumb("面包屑路径: %s\n", gOvCrumbPath);
+}
+
 /* 帧内更新期间把 stdout 静音：远程调用每次都打印十几行 (rc)/(pac)，
    30Hz × 几十次调用会把日志刷爆（Logger 逐块 fsync，管道写满后 printf 会直接阻塞）。
    dup2 到 /dev/null，更新完恢复；期间保留一个真实 fd 给 ov_status。 */
@@ -463,6 +528,7 @@ static bool ov_build(RemoteCall *proc)
        第一步建准星（立刻可见），其后 %d 步每步建一对（方框+距离文字）。
        带节奏地建，约 0.5~0.8 秒就在前台期间全部建好。 */
     for (int i = 0; i <= slots && !gOvBuildFailed; i++) {
+        ov_crumb("build step %d/%d calls=%lu\n", i, slots + 1, gOvCallCount);
         ov_build_slots_step();
         if (!gOvBuildFailed) usleep(20 * 1000);
     }
@@ -721,6 +787,7 @@ static void ov_tick(void)
     pthread_mutex_lock(&gOvLock);
     if (!gOvRunning) { pthread_mutex_unlock(&gOvLock); return; }
 
+    ov_crumb("tick draw slots=%d snap=%d\n", gOvSlotsAllocated, gOvSnapFresh ? 1 : 0);
     ov_log_mute();                 /* 帧内静音，避免 (rc)/(pac) 刷爆日志 */
     /* 兜底：万一建格子循环没走完（例如前面崩过），这里继续把剩下的补上 */
     if (!gOvBuildFailed && !(gOvBuilderStep >= gOvSlotTarget && gOvCrossDone)) {
@@ -844,6 +911,7 @@ bool clock_overlay_failed(void) { return gOvFailed; }
 bool clock_overlay_start(RemoteCall *proc)
 {
     if (!proc) { ov_status("RemoteCall 为空：请先在首页初始化远程调用"); return false; }
+    ov_crumb_install();
 
     pthread_mutex_lock(&gOvLock);
     if (gOvRunning) { pthread_mutex_unlock(&gOvLock); return true; }
