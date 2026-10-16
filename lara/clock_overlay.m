@@ -24,14 +24,16 @@
 //      for the window, alloc + init for views, r_nsstr_retained + CFRelease for
 //      strings, r_settle_us(1500).
 //
-//  Screenshot / recording protection (best effort, two independent mechanisms):
-//   * the pill lives inside a UITextField with secureTextEntry = YES — UIKit
-//     treats secure input as capturable-ineligible, and keeps its subtree out of
-//     screenshots and screen recordings;
-//   * the host window is probed for the private capture switches that exist on
-//     some iOS builds (setSecure: / _setSecure: / setScreenCaptureProhibited:).
-//     Whatever the window answers to is used; if it answers to none, the pill is
-//     still protected by the secure field.
+//  Screenshot / recording protection (two independent mechanisms):
+//   * recording and mirroring: the tick reads [UIScreen mainScreen].isCaptured in
+//     lara's own process and hides the whole overlay while the screen is being
+//     captured, restoring it afterwards. This needs no private behaviour and
+//     cannot silently fail;
+//   * screenshots: the pill lives inside a UITextField with secureTextEntry = YES
+//     (UIKit treats secure input as capturable-ineligible), and the window and the
+//     pill are each probed for the private capture switches that exist on some iOS
+//     builds (_setSecure: / setSecure: / setScreenCaptureProhibited:). Step [8/9]
+//     reports which object answered to what.
 //
 //  Steps print "(clock) [n/9] ..." to stdout, which lara's logger captures, so
 //  lara.log always ends at the last call that came back.
@@ -80,6 +82,8 @@ static uint64_t gClockWindow = 0;
 static uint64_t gClockContainer = 0;   /* the secure text field */
 static uint64_t gClockPill = 0;        /* the label with the time */
 static bool gClockWindowSecured = false;
+static const char *gClockPillSecuredBy = NULL;
+static bool gClockHiddenForCapture = false;   /* hidden because the screen is being captured */
 static char gClockLastText[CLOCK_TEXT_MAX] = {0};
 static char gClockStatus[CLOCK_STATUS_MAX] = "尚未启动";
 
@@ -102,6 +106,51 @@ static NSDateFormatter *clock_formatter(void)
         fmt.dateFormat = @"HH:mm:ss";
     }
     return fmt;
+}
+
+/* One-line description of what is currently protecting the pill. */
+static const char *clock_protection_summary(void)
+{
+    if (gClockWindowSecured && gClockPillSecuredBy) return "安全层+窗口开关+图层开关+录屏隐藏";
+    if (gClockWindowSecured || gClockPillSecuredBy)  return "安全层+图层开关+录屏隐藏";
+    return "安全层+录屏隐藏";
+}
+
+/* Asks `obj` for the private capture switches, in order, and applies the first
+   one it answers to. Returns the selector that took, or NULL. */
+static const char *clock_apply_secure_switch(RemoteCall *proc, uint64_t obj)
+{
+    if (!r_is_objc_ptr(obj)) return NULL;
+    for (size_t i = 0; i < CLOCK_SECURE_SELECTOR_COUNT; i++) {
+        if (r_responds_main(obj, kClockSecureSelectors[i])) {
+            r_msg2_main(obj, kClockSecureSelectors[i], 1, 0, 0, 0);
+            return kClockSecureSelectors[i];
+        }
+    }
+    return NULL;
+}
+
+/* Screen recording / mirroring protection that needs no private behaviour at
+   all: while the screen is being captured, the whole overlay is hidden, and it
+   comes back when the capture ends. [UIScreen isCaptured] is read in *this*
+   process (lara sits on the same screen), so the check costs no remote call.
+   Caller must hold gClockLock. */
+static void clock_sync_capture_state(void)
+{
+    if (!r_is_objc_ptr(gClockPill) && !r_is_objc_ptr(gClockWindow)) return;
+
+    BOOL captured = [UIScreen mainScreen].isCaptured;
+    if ((bool)captured == gClockHiddenForCapture) return;   /* nothing changed */
+    gClockHiddenForCapture = (bool)captured;
+
+    uint64_t flag = captured ? 1 : 0;
+    if (r_is_objc_ptr(gClockContainer)) r_msg2_main(gClockContainer, "setHidden:", flag, 0, 0, 0);
+    if (r_is_objc_ptr(gClockPill))      r_msg2_main(gClockPill, "setHidden:", flag, 0, 0, 0);
+    if (r_is_objc_ptr(gClockWindow))    r_msg2_main(gClockWindow, "setHidden:", flag, 0, 0, 0);
+
+    printf("(clock) 捕获状态: %s → 悬浮时间已%s\n", captured ? "检测到录屏/镜像" : "结束",
+           captured ? "隐藏" : "恢复");
+    fflush(stdout);
 }
 
 /* Pushes the current time into the pill (main thread, one call per second).
@@ -145,7 +194,10 @@ static void clock_start_timer(RemoteCall *proc)
     /* `proc` is captured strongly so the RemoteCall stays alive while ticking. */
     dispatch_source_set_event_handler(timer, ^{
         pthread_mutex_lock(&gClockLock);
-        if (gClockRunning) clock_push_text();
+        if (gClockRunning) {
+            clock_sync_capture_state();
+            if (!gClockHiddenForCapture) clock_push_text();
+        }
         pthread_mutex_unlock(&gClockLock);
     });
 
@@ -284,17 +336,14 @@ static bool clock_build(RemoteCall *proc)
     clock_status("[%d/9] 安全容器 field=0x%llx secureTextEntry=1 frame=%.0f,%.0f", step, field,
                  frame.origin.x, frame.origin.y);
 
-    /* 8/9 — window-level capture switches, only if the window knows them. */
-    const char *securedBy = NULL;
-    for (size_t i = 0; i < CLOCK_SECURE_SELECTOR_COUNT && !securedBy; i++) {
-        if (r_responds_main(window, kClockSecureSelectors[i])) {
-            r_msg2_main(window, kClockSecureSelectors[i], 1, 0, 0, 0);
-            securedBy = kClockSecureSelectors[i];
-        }
-    }
+    /* 8/9 — capture switches, probed on the window and on the pill itself. */
+    const char *securedBy = clock_apply_secure_switch(proc, window);
     gClockWindowSecured = (securedBy != NULL);
+    const char *pillSecuredBy = clock_apply_secure_switch(proc, pill);
+    gClockPillSecuredBy = pillSecuredBy;
     step++;
-    clock_status("[%d/9] 窗口捕获开关: %s", step, securedBy ? securedBy : "无（仅靠安全输入层）");
+    clock_status("[%d/9] 捕获开关: window=%s pill=%s", step,
+                 securedBy ? securedBy : "无", pillSecuredBy ? pillSecuredBy : "无");
 
     /* 9/9 — first text, then show, then verify. */
     gClockContainer = field;
@@ -306,8 +355,7 @@ static bool clock_build(RemoteCall *proc)
     uint64_t hidden = r_msg2_main(pill, "isHidden", 0, 0, 0, 0);
     step++;
     clock_status("[%d/9] 校验 tag=0x%llx(应为0x%llx) hidden=%llu 防录屏=%s", step, found, pill,
-                 (unsigned long long)(hidden & 0xff),
-                 gClockWindowSecured ? "窗口开关+安全层" : "安全层");
+                 (unsigned long long)(hidden & 0xff), clock_protection_summary());
 
     gClockWindow = window;
     gClockPid = proc.pid;
@@ -352,6 +400,9 @@ bool clock_overlay_start(RemoteCall *proc)
     gClockWindow = 0;
     gClockContainer = 0;
     gClockPill = 0;
+    gClockWindowSecured = false;
+    gClockPillSecuredBy = NULL;
+    gClockHiddenForCapture = false;
     gClockLastText[0] = '\0';
 
     bool attached = clock_build(proc);
@@ -364,8 +415,7 @@ bool clock_overlay_start(RemoteCall *proc)
     gClockRunning = true;
     clock_start_timer(proc);
     clock_status("已显示：window=0x%llx field=0x%llx pill=0x%llx 防录屏=%s",
-                 gClockWindow, gClockContainer, gClockPill,
-                 gClockWindowSecured ? "窗口开关+安全层" : "安全层");
+                 gClockWindow, gClockContainer, gClockPill, clock_protection_summary());
 
     pthread_mutex_unlock(&gClockLock);
     return true;
@@ -395,6 +445,8 @@ bool clock_overlay_selftest(RemoteCall *proc)
     gClockContainer = 0;
     gClockPill = 0;
     gClockWindowSecured = false;
+    gClockPillSecuredBy = NULL;
+    gClockHiddenForCapture = false;
     gClockLastText[0] = '\0';
     pthread_mutex_unlock(&gClockLock);
 
