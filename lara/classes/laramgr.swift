@@ -577,6 +577,10 @@ final class laramgr: ObservableObject {
                     self.rcready = true
                     // 远程调用一就绪就自动显示全局悬浮时间
                     self.startClock()
+                    // 并按设置封锁整机截屏/录屏
+                    if UserDefaults.standard.object(forKey: "runtimeCaptureBlock") as? Bool ?? true {
+                        self.applyCaptureBlock()
+                    }
                 } else {
                     self.logmsg("remote call init failed on \(process)")
                     let error = RemoteCall.lastInitError()
@@ -633,6 +637,10 @@ final class laramgr: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             if clockWasRunning, let sbProc = self?.sbProc {
                 clock_overlay_stop(sbProc)
+            }
+            // Put the capture methods back before the session goes away.
+            if let sbProc = self?.sbProc, sb_capture_block_active() {
+                sb_capture_block_revert(sbProc)
             }
             self?.sbProc?.destroy()
             // remote_objc's global helpers still point at the session we just
@@ -746,6 +754,38 @@ final class laramgr: ObservableObject {
                 self?.clockrunning = ok && clock_overlay_is_running()
                 self?.clockstatus = status
                 self?.logmsg("(clock) 自检\(ok ? "成功" : "失败")：\(status)")
+            }
+        }
+    }
+
+    // ── 运行时禁止录屏/截屏（SpringBoard 侧封锁） ──
+
+    /// 枚举 SpringBoard 的捕获服务并把截屏/录屏动作置空。
+    func applyCaptureBlock() {
+        guard dsready, let sbProc else {
+            logmsg("(capblock) 远程调用未就绪，无法封锁")
+            return
+        }
+        guard !sb_capture_block_active() else { return }
+        logmsg("(capblock) 开始封锁整机截屏/录屏…")
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let patched = sb_capture_block_apply(sbProc)
+            let status = String(cString: sb_capture_block_status())
+            DispatchQueue.main.async {
+                self?.logmsg("(capblock) 已置空 \(patched) 个动作方法 — \(status)")
+            }
+        }
+    }
+
+    /// 还原被置空的方法（关闭开关或销毁远程调用前调用）。
+    func revertCaptureBlock() {
+        guard let sbProc, sb_capture_block_active() else { return }
+        logmsg("(capblock) 正在还原截屏/录屏方法…")
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            sb_capture_block_revert(sbProc)
+            let status = String(cString: sb_capture_block_status())
+            DispatchQueue.main.async {
+                self?.logmsg("(capblock) \(status)")
             }
         }
     }

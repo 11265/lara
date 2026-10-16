@@ -56,6 +56,7 @@ struct SettingsView: View {
     @AppStorage("logsdisplaymode") private var selectedlogdisplaymode: logsdisplaymode = .toolbar
     @AppStorage("loggerNoBS") private var loggerNoBS: Bool = true
     @AppStorage("captureShield") private var captureShield: Bool = true
+    @AppStorage("runtimeCaptureBlock") private var runtimeCaptureBlock: Bool = true
 
     var body: some View {
         NavigationStack {
@@ -181,7 +182,15 @@ struct SettingsView: View {
                     }
                 }
                 
-                Section(header: HeaderLabel(text: "应用", icon: "gearshape"), footer: Text("后台保活让应用被最小化后继续运行；全界面防录屏/防截屏会把整个界面放进安全输入层，截图与录屏中本应用的内容为空白。")) {
+                Section(header: HeaderLabel(text: "应用", icon: "gearshape"), footer: Text("后台保活让应用被最小化后继续运行；全界面防录屏/防截屏会把整个界面放进安全输入层；运行时禁止录屏/截屏则会在 SpringBoard 里把截屏与录屏动作置空（整机生效，可用开关还原）。")) {
+                    Toggle("运行时禁止录屏 / 截屏（整机）", isOn: $runtimeCaptureBlock)
+                        .onChange(of: runtimeCaptureBlock) { enabled in
+                            if enabled {
+                                mgr.applyCaptureBlock()
+                            } else {
+                                mgr.revertCaptureBlock()
+                            }
+                        }
                     Toggle("全界面防录屏 / 防截屏", isOn: $captureShield)
                         .onChange(of: captureShield) { enabled in
                             CaptureShield.sync(enabled: enabled)
