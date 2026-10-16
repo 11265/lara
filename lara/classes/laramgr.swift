@@ -711,29 +711,96 @@ final class laramgr: ObservableObject {
 
     private var lastLandscape = false
 
-    /// 悬浮层完全不吃触摸，所以画面参数全部由 app 写进页面地址：
-    /// 改了设置 → 浮层每秒比对地址 → 变了就热重载（不用重启、不用点屏幕）。
-    func fpvEffectiveURL() -> String {
+    /// 悬浮层现在用**原生 UIView** 绘制（参考 peace_esp）：方框是 layer 边框、文字是 UILabel。
+    /// 数据仍走局域网：lara 直接轮询电脑上 rr/fpv 服务的 /api/state，压成一行交给 C 层。
+    /// fpvURL 就是那个数据服务地址（例如 http://192.168.137.1:18099/）。
+    func fpvDataBase() -> String {
         var base = (UserDefaults.standard.string(forKey: "fpvURL") ?? Self.fpvDefaultURL)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if base.isEmpty { base = Self.fpvDefaultURL }
-        let d = UserDefaults.standard
-        var items: [String] = []
-        if let fov = d.object(forKey: "fpvFov") as? Double { items.append("fov=\(Int(fov))") }
-        if let eye = d.object(forKey: "fpvEye") as? Double {
-            items.append("eye=" + String(format: "%.1f", eye))
-        }
-        if let tau = d.object(forKey: "fpvTau") as? Double { items.append("tau=\(Int(tau))") }
-        if d.object(forKey: "fpvDist") != nil { items.append("dist=\(d.bool(forKey: "fpvDist") ? 1 : 0)") }
-        if d.object(forKey: "fpvCross") != nil { items.append("cross=\(d.bool(forKey: "fpvCross") ? 1 : 0)") }
-        if d.object(forKey: "fpvHud") != nil { items.append("hud=\(d.bool(forKey: "fpvHud") ? 1 : 0)") }
-        guard !items.isEmpty else { return base }
-        return base + (base.contains("?") ? "&" : "?") + items.joined(separator: "&")
+        if !base.hasPrefix("http") { base = "http://" + base }
+        var cut = base
+        if let q = cut.firstIndex(of: "?") { cut = String(cut[cut.startIndex..<q]) }
+        while cut.hasSuffix("/") { cut.removeLast() }
+        return cut
     }
 
-    /// 设置变更后调用：把新地址推给浮层（浮层活着就热重载，没开就等下次启动用）。
+    /// 设置变更时同步给浮层：URL（诊断显示）+ 几何 + 方向 + 画面参数。
     func refreshOverlayUrl() {
-        fpvEffectiveURL().withCString { clock_overlay_set_url($0) }
+        pushOverlayConfig()
+    }
+
+    func pushOverlayConfig() {
+        let d = UserDefaults.standard
+        fpvDataBase().withCString { clock_overlay_set_url($0) }
+        let ratio = d.object(forKey: "fpvWidth") as? Double ?? 0.92
+        let top = d.object(forKey: "fpvTop") as? Double ?? 56.0
+        let hRatio = d.object(forKey: "fpvHeight") as? Double ?? 0.0
+        clock_overlay_set_geometry(ratio, top)
+        clock_overlay_set_height_ratio(hRatio)
+        let fov = d.object(forKey: "fpvFov") as? Double ?? 90
+        let eye = d.object(forKey: "fpvEye") as? Double ?? 1.6
+        let dist = d.object(forKey: "fpvDist") != nil ? d.bool(forKey: "fpvDist") : true
+        let cross = d.object(forKey: "fpvCross") != nil ? d.bool(forKey: "fpvCross") : true
+        clock_overlay_set_view(24, fov, eye, 0, dist ? 1 : 0, cross ? 1 : 0)
+        pushLayout()
+    }
+
+    // ── 局域网数据：每 100ms 拉一次，压成 "self;x,y,z,kind;..." 交给浮层 ──
+    private var snapTimer: Timer?
+    private var snapBusy = false
+
+    func startSnapshotPolling() {
+        stopSnapshotPolling()
+        snapTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+            self?.fetchSnapshot()
+        }
+        if let t = snapTimer { RunLoop.main.add(t, forMode: .common) }
+    }
+
+    func stopSnapshotPolling() {
+        snapTimer?.invalidate()
+        snapTimer = nil
+        snapBusy = false
+    }
+
+    private func fetchSnapshot() {
+        guard clockrunning, !snapBusy else { return }
+        guard let url = URL(string: fpvDataBase() + "/api/state") else { return }
+        snapBusy = true
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 2
+        req.cachePolicy = .reloadIgnoringLocalCacheData
+        URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
+            guard let self else { return }
+            var line = ""
+            if let data, let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let selfPos = obj["self"] as? [Double], selfPos.count >= 3 {
+                let fresh = (obj["self_aim_yaw"] as? Double).map { _ in
+                    (obj["self_aim_age_ms"] as? Double).map { $0 <= 250 } ?? true
+                } ?? false
+                let yaw = (fresh ? obj["self_aim_yaw"] as? Double : nil)
+                    ?? (obj["self_yaw"] as? Double) ?? 0
+                let pitch = (obj["self_pitch"] as? Double) ?? 0
+                line = String(format: "%.1f,%.1f,%.1f,%.2f,%.2f", selfPos[0], selfPos[1], selfPos[2], yaw, pitch)
+                if let ents = obj["entities"] as? [[String: Any]] {
+                    var n = 0
+                    for e in ents {
+                        guard let w = e["world"] as? [Double], w.count >= 3 else { continue }
+                        let kind: Int
+                        if (e["kind"] as? String) == "mate" { kind = 1 }
+                        else if (e["is_bot"] as? Bool) == true || (e["kind"] as? String) == "ai" { kind = 2 }
+                        else { kind = 0 }
+                        line += String(format: ";%.1f,%.1f,%.1f,%d", w[0], w[1], w[2], kind)
+                        n += 1
+                        if n >= 48 { break }
+                    }
+                }
+            }
+            self.snapBusy = false
+            if line.isEmpty { clock_overlay_set_snapshot(nil) }
+            else { line.withCString { clock_overlay_set_snapshot($0) } }
+        }.resume()
     }
 
     func startClock() {
@@ -750,16 +817,8 @@ final class laramgr: ObservableObject {
             UserDefaults.standard.set(true, forKey: "keepAlive")
             logmsg("(fpv) 已自动开启后台保活")
         }
-        // 页面地址（含 app 里的画面参数）与尺寸来自设置（第一视角页）
-        let url = fpvEffectiveURL()
-        let ratio = UserDefaults.standard.object(forKey: "fpvWidth") as? Double ?? 0.92
-        let top = UserDefaults.standard.object(forKey: "fpvTop") as? Double ?? 56.0
-        let hRatio = UserDefaults.standard.object(forKey: "fpvHeight") as? Double ?? 0.0
-        url.withCString { clock_overlay_set_url($0) }
-        clock_overlay_set_geometry(ratio, top)
-        clock_overlay_set_height_ratio(hRatio)
-        pushLayout()                       // 方向 + 全屏 + 分辨率
-        logmsg("(fpv) 开始加载第一视角：\(url)（宽 \(Int(ratio * 100))%，\(lastLandscape ? "横屏" : "竖屏")\(UserDefaults.standard.bool(forKey: "fpvFullscreen") ? " 全屏" : "")）")
+        pushOverlayConfig()
+        logmsg("(fpv) 启动原生绘制浮层：数据源 \(fpvDataBase())/api/state（\(lastLandscape ? "横屏" : "竖屏")\(UserDefaults.standard.bool(forKey: "fpvFullscreen") ? " 全屏" : "")）")
         clockstarting = true
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let ok = clock_overlay_start(sbProc)
@@ -769,12 +828,14 @@ final class laramgr: ObservableObject {
                 self?.clockrunning = ok
                 self?.clockstatus = status
                 self?.logmsg(ok ? "(fpv) \(status)" : "(fpv) 失败：\(status)")
+                if ok { self?.startSnapshotPolling() }
             }
         }
     }
 
     func stopClock() {
         guard clockrunning else { return }
+        stopSnapshotPolling()
         guard let sbProc else {
             clockrunning = false
             return

@@ -2,15 +2,15 @@
 //  clock_overlay.h
 //  lara
 //
-//  Global floating overlay, drawn by the target process (SpringBoard) so it
-//  floats above everything.
+//  Global floating overlay = 第一视角（FPS）雷达，原生绘制。
 //
-//  现在的内容是「第一视角（FPS）雷达」：浮层里放一个 WKWebView，加载局域网
-//  服务（rr/fpv）提供的页面，数据由那台电脑的解析核心经局域网送到手机上。
-//  若目标进程里没有 WKWebView（或建不出来），会自动退回原来的时间胶囊，
-//  保证浮层永远不会因为缺类而不可用。
+//  绘制方式参考 peace_esp（准猫/沐辞 的开源绘制版）：在目标进程里建一个高层级
+//  UIWindow，往上面放**原生 UIView**（layer 边框画方框）+ UILabel（名字/距离）
+//  + 中心准星（两条细 UIView）。刻意不用 WKWebView —— 它的内部视图与手势识别器
+//  正是"覆盖区域吃触摸"与崩溃的来源。
 //
-//  Data source: 局域网 http://<电脑IP>:<端口>/ —— 不读内存、不读其它进程。
+//  数据不读内存：由 lara 通过局域网从电脑上的 rr/fpv 服务取 /api/state，压成一行
+//  紧凑文本交给这里（clock_overlay_set_snapshot）。
 //
 
 #ifndef clock_overlay_h
@@ -22,57 +22,35 @@
 
 #import "TaskRop/RemoteCall.h"
 
-/// 第一视角页面的地址，例如 "http://192.168.137.1:18099/"。
-/// 传 NULL 或空串则用内置默认值。必须在 clock_overlay_start() 之前调用。
-void clock_overlay_set_url(const char *url);
+/// 配置：方框格数上限、视野角（度）、眼高（米）、是否画名字/距离/准星。
+void clock_overlay_set_view(int maxSlots, double fovDeg, double eyeHeight,
+                            int showNames, int showDist, int showCross);
 
-/// 浮层几何：widthRatio 为宽度占屏比（0.2~1.0，<=0 用默认 0.92），
-/// topMargin 为距屏幕顶部点数（<=0 用默认值）。高度按 16:9 计算。
+/// 几何：宽度占屏比（0.2~1.0，<=0 用默认）+ 距顶距离。
 void clock_overlay_set_geometry(double widthRatio, double topMargin);
 
-/// 面板高度占屏比：0（默认）= 按 16:9 算；0.1~1.0 = 直接按屏高比例（配合
-/// widthRatio=1.0 就能做成"顶部条/上半屏"，把下半屏留给游戏操作）。
+/// 面板高度占屏比：0（默认）= 按 16:9 算；0.1~1.0 = 直接按屏高比例。
 void clock_overlay_set_height_ratio(double heightRatio);
 
-/// 屏幕方向与全屏：
-///   landscape  = 1 表示设备当前是横屏（浮层按设备长短边对调后铺开）；
-///   fullscreen = 1 表示页面铺满整屏（否则按 widthRatio 的 16:9 面板）。
-/// 尺寸一律按本机真实分辨率算，并在值变化时只重设 frame（不重建、不重新加载页面）。
+/// 方向（用户手选）：landscape=1 横屏 / 0 竖屏；fullscreen=1 铺满整屏。
 void clock_overlay_set_layout(int landscape, int fullscreen);
 
-/// 当前浮层内容的地址（只读，永不返回 NULL）。
+/// 一帧快照（由 lara 从局域网数据压成的一行）：
+///   "self_x,self_y,self_z,yaw,pitch;x,y,z,kind;x,y,z,kind;..."
+/// 坐标是 UE 厘米；kind: 0=敌人 1=队友 2=AI 3=其它。NULL/空串 = 暂无数据。
+void clock_overlay_set_snapshot(const char *compact);
+
+/// 数据服务地址（只用于状态显示与诊断）。
+void clock_overlay_set_url(const char *url);
+
+const char *clock_overlay_status(void);
 const char *clock_overlay_url(void);
 
-/// Creates (or re-shows) the floating overlay in `proc` — expected to be a live
-/// SpringBoard RemoteCall — and keeps it alive afterwards.
-/// Returns true when the overlay was attached and made visible.
 bool clock_overlay_start(RemoteCall *proc);
-
-/// Tears the overlay down and rebuilds it from scratch, printing a numbered
-/// line for every step into stdout (which lara's logger captures). Meant for
-/// the "自检" button: if a step kills the remote call, the last line in the log
-/// says exactly which one it was.
 bool clock_overlay_selftest(RemoteCall *proc);
-
-/// Hides the overlay. The objects are kept (not destroyed), so starting it
-/// again is instant; a respring clears it for good.
-/// Safe to call when the overlay is not running.
 void clock_overlay_stop(RemoteCall *proc);
-
-/// True while the overlay is up.
 bool clock_overlay_is_running(void);
-
-/// True when a previous start failed *after* it had already touched the remote
-/// session. lara must not auto-retry in that state: the target's remote-call
-/// argument buffer is global state, and hammering it while it is broken is what
-/// took SpringBoard down. Cleared by clock_overlay_selftest().
 bool clock_overlay_failed(void);
-
-/// Human readable one-line state of the last start attempt (never NULL).
-const char *clock_overlay_status(void);
-
-/// Drops the binding to the RemoteCall session (call it when lara destroys the
-/// remote call, so a later start cannot use a destroyed session).
 void clock_overlay_unbind(void);
 
 #endif /* __OBJC__ */

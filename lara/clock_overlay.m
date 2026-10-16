@@ -2,26 +2,21 @@
 //  clock_overlay.m
 //  lara
 //
-//  Global floating overlay = 第一视角（FPS）雷达。
+//  Global floating overlay = 第一视角（FPS）雷达 · 原生绘制版。
 //
-//  浮层由 SpringBoard 绘制（所以能浮在所有应用之上）。内容优先用 WKWebView
-//  加载局域网页面 http://<电脑IP>:<端口>/（rr/fpv 服务，数据来自电脑上的解析
-//  核心）；如果目标进程里拿不到 WKWebView，就退回原来的时间胶囊。
+//  为什么这么写（参考 peace_esp / 准猫&沐辞 的开源绘制版，以及本机的真机日志）：
+//   1. 绘制只用**原生 UIView + UILabel**：方框 = layer.borderWidth/borderColor，
+//      文字 = UILabel。不用 WKWebView —— 它内部会建 WKContentView/WKScrollView
+//      并挂手势识别器，是"覆盖区域吃触摸"和启动崩溃的来源。
+//   2. 目标侧调用全部走 remote_objc 的 r_msg2_main* 家族；标量（BOOL/NSInteger/
+//      CGFloat/CGRect）一律用 r_msg2_main_raw 按字节传，对象才用 r_msg2_main。
+//      （用对象形态传标量时目标侧收到的是垃圾值，setUserInteractionEnabled: 会失效。）
+//   3. 几何/投影全部在 lara 侧算好，只把 frame/文本推给目标，尽量减少远程调用。
+//   4. 每帧更新会临时把 stdout 接到 /dev/null：远程调用每次都会打印十几行 (rc)/(pac)，
+//      30Hz 下足以把日志刷爆；更新完立刻恢复，lara 自己的日志照常。
 //
-//  为什么沿用旧的调用形态（来自真机日志的教训）：
-//   1. 所有目标侧调用都走 remote_objc 的 r_msg2_main* 家族
-//      (NSInvocation + -performSelectorOnMainThread:)。直接 remote_msg 会在
-//      hijack 线程上裸调 objc_msgSend，在这台设备上第一次对象方法调用就打死线程。
-//   2. 不做“返回结构体”的远程调用：远程读 [UIScreen mainScreen].bounds 会把目标
-//      卡死。几何一律在本地读（lara 与 SpringBoard 同一块屏幕）。
-//   3. 带结构体参数（CGRect 等）的调用用 r_msg2_main_raw 传指针 + 长度，
-//      与旧的 setWindowLevel:/setFrame: 完全一致。
-//
-//  地址与尺寸可热改：主进程把偏好写进 UserDefaults，这里的定时器每秒比对一次，
-//  变了就重新 loadRequest，不用重启 lara。
-//
-//  每一步都会打印 "(overlay) [n/m] ..." 到 stdout，由 lara 的日志捕获，
-//  日志停在哪个编号就说明哪一步把远程调用弄死了。
+//  数据来源：lara 通过局域网从电脑上的 rr/fpv 服务取 /api/state，压成一行文本后
+//  调 clock_overlay_set_snapshot()。不读内存、不读其它进程。
 //
 
 #import "clock_overlay.h"
@@ -31,81 +26,103 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <dispatch/dispatch.h>
+#import <fcntl.h>
+#import <math.h>
 #import <pthread.h>
 #import <stdarg.h>
 #import <stdio.h>
+#import <stdlib.h>
 #import <string.h>
 #import <unistd.h>
 
 #pragma mark - Tunables
 
 #define OV_TAG                0x1A2B3C4DULL
-#define OV_WINDOW_LEVEL       999999.0   /* above app windows and alerts */
-#define OV_DEFAULT_URL        "http://192.168.137.1:18099/"
-#define OV_URL_MAX            256
+#define OV_WINDOW_LEVEL       999999.0
 #define OV_STATUS_MAX         512
-#define OV_TICK_MS            250ULL     /* 4x/s：胶囊走秒；网页每 OV_URL_CHECK_TICKS 次比对地址 */
-#define OV_URL_CHECK_TICKS    4          /* 4 * 250ms = 1s 检查一次地址变化 */
+#define OV_URL_MAX            256
+#define OV_SNAP_MAX           4096
+#define OV_MAX_SLOTS          48
+#define OV_DEFAULT_SLOTS      24
+#define OV_TICK_HZ            30                      /* 绘制帧率 */
+#define OV_TICK_MS            (1000 / OV_TICK_HZ)
+#define OV_DEFAULT_FOV        90.0
+#define OV_DEFAULT_EYE        1.60
+#define OV_PERSON_HEIGHT      1.80                    /* 米 */
+#define OV_MIN_BOX_PX         24.0
+#define OV_NAME_TEXT_MAX      32
 
-/* 胶囊（退回方案）外观 */
-#define OV_PILL_WIDTH         92.0
-#define OV_PILL_HEIGHT        26.0
-#define OV_PILL_RADIUS        8.0
-#define OV_PILL_FONT          15.0
-#define OV_PILL_TEXT_MAX      16
-
-/* 第一视角浮层默认几何 */
-#define OV_WEB_WIDTH_RATIO    0.92       /* 屏宽占比 */
-#define OV_WEB_TOP            56.0       /* 避开状态栏/刘海 */
-#define OV_WEB_ASPECT         9.0 / 16.0 /* 高 = 宽 * 9/16 */
+/* 原生绘制用的几何（目标侧坐标） */
+typedef struct { double x, y, w, h; } OV_Rect;
 
 #pragma mark - State
 
 static pthread_mutex_t gOvLock = PTHREAD_MUTEX_INITIALIZER;
 static dispatch_source_t gOvTimer = nil;
 static bool gOvRunning = false;
-static pid_t gOvPid = 0;
-static uint64_t gOvWindow = 0;
-static uint64_t gOvPill = 0;             /* 退回方案：时间胶囊 */
-static uint64_t gOvWeb = 0;              /* 主方案：WKWebView */
-static bool gOvWebMode = false;
-static char gOvLastText[OV_PILL_TEXT_MAX] = {0};
-static char gOvStatus[OV_STATUS_MAX] = "尚未启动";
-static char gOvUrl[OV_URL_MAX] = OV_DEFAULT_URL;
-static char gOvUrlLoaded[OV_URL_MAX] = {0};
-static double gOvWidthRatio = OV_WEB_WIDTH_RATIO;
-static double gOvTop = OV_WEB_TOP;
-static double gOvHeightRatio = 0.0;   /* 0 = 16:9；>0 = 按屏高比例（顶部条/上半屏） */
-static unsigned gOvTick = 0;
-/* 单飞 + 失败闩锁：
-   远程调用的参数缓冲区在 lara 进程里是全局共享的，两次远程调用同时在飞
-   （真机日志里出现过：malloc/getpid 的回复交错）会让 malloc 返回垃圾指针，
-   接着 remote_write 写到地址 0，目标进程就带着脏寄存器执行 objc_getClass →
-   SpringBoard 崩溃。所以：同一时刻只允许一次构建；一旦失败，绝不再自动重试。 */
 static bool gOvBuilding = false;
 static bool gOvFailed = false;
-static unsigned gOvGuard = 0;      /* 触摸穿透自愈计数（每 120 个 tick = 30 秒一次） */
-static unsigned gOvWebWait = 0;    /* 网页加载等待计数（24 个 tick = 6 秒） */
-static unsigned gOvOrientTick = 0;  /* 方向轮询计数（已改手选，仅保留占位） */
-static unsigned gOvTreeWalked = 0;  /* 网页子树交互关闭的补做计数（2 秒后补一次） */
+static pid_t gOvPid = 0;
 
-/* 前置声明：这两个在 ov_apply_layout / ov_tick 里用到，定义在文件后半部分 */
-static void ov_poll_orientation(void);
-static int ov_target_interface_orientation(void);
+static uint64_t gOvWindow = 0;
+static uint64_t gOvBox[OV_MAX_SLOTS];
+static uint64_t gOvName[OV_MAX_SLOTS];
+static uint64_t gOvDist[OV_MAX_SLOTS];
+static uint64_t gOvCrossH = 0, gOvCrossV = 0;
+static int gOvSlotsAllocated = 0;
 
-/* 方向 / 全屏：由 lara 主线程用设备方向推过来（见 clock_overlay_set_layout）。
-   目标进程的窗口空间跟随设备方向，所以横屏 = 长短边对调；尺寸全部按本机真实
-   分辨率算，方向变化时只重设 frame，不重建浮层、不重新加载页面。 */
-static int gOvLandscape = 0;
+static char gOvStatus[OV_STATUS_MAX] = "尚未启动";
+static char gOvUrl[OV_URL_MAX] = "";
+static char gOvSnap[OV_SNAP_MAX] = {0};
+static bool gOvSnapFresh = false;
+
+/* 用户配置 */
+static int gOvMaxSlots = OV_DEFAULT_SLOTS;
+static double gOvFov = OV_DEFAULT_FOV;
+static double gOvEye = OV_DEFAULT_EYE;
+static int gOvShowNames = 1;
+static int gOvShowDist = 1;
+static int gOvShowCross = 1;
+static double gOvWidthRatio = 0.92;
+static double gOvTop = 56.0;
+static double gOvHeightRatio = 0.0;
+static int gOvLandscape = 1;          /* 默认横屏（用户手选） */
 static int gOvFullscreen = 0;
-static int gOvAppliedLandscape = -1;
-static int gOvAppliedFullscreen = -1;
-static double gOvAppliedW = 0;
-static double gOvAppliedH = 0;
 
-/* BOOL / NSInteger 参数必须走 raw 形态按字节传：
-   用 r_msg2_main(obj, sel, 0, ...) 传标量时，参数会被当成“对象”，目标侧实际
-   收到垃圾值（真机表现＝ setUserInteractionEnabled: 没生效，全屏浮层把触摸全吃掉）。 */
+static void ov_status(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(gOvStatus, sizeof(gOvStatus), fmt, ap);
+    va_end(ap);
+    printf("(overlay) %s\n", gOvStatus);
+    fflush(stdout);
+}
+
+/* 帧内更新期间把 stdout 静音：远程调用每次都打印十几行 (rc)/(pac)，
+   30Hz × 几十次调用会把日志刷爆。dup2 到 /dev/null，更新完恢复。 */
+static int gOvSavedStdout = -1;
+static void ov_log_mute(void)
+{
+    fflush(stdout);
+    if (gOvSavedStdout >= 0) return;
+    int devnull = open("/dev/null", O_WRONLY);
+    if (devnull < 0) return;
+    gOvSavedStdout = dup(STDOUT_FILENO);
+    dup2(devnull, STDOUT_FILENO);
+    close(devnull);
+}
+static void ov_log_unmute(void)
+{
+    if (gOvSavedStdout < 0) return;
+    fflush(stdout);
+    dup2(gOvSavedStdout, STDOUT_FILENO);
+    close(gOvSavedStdout);
+    gOvSavedStdout = -1;
+}
+
+#pragma mark - 远程调用小工具（标量必须按字节传）
+
 static void ov_set_bool(uint64_t obj, const char *sel, bool value)
 {
     if (!r_is_objc_ptr(obj)) return;
@@ -118,7 +135,17 @@ static void ov_set_int(uint64_t obj, const char *sel, long long value)
     long long v = value;
     r_msg2_main_raw(obj, sel, &v, sizeof(v), NULL, 0, NULL, 0, NULL, 0);
 }
-/* 设置 UILabel 文本（对象参数，走 r_msg2_main；字符串在目标侧 retained 后要释放）。 */
+static void ov_set_double(uint64_t obj, const char *sel, double value)
+{
+    if (!r_is_objc_ptr(obj)) return;
+    double v = value;
+    r_msg2_main_raw(obj, sel, &v, sizeof(v), NULL, 0, NULL, 0, NULL, 0);
+}
+static void ov_set_rect(uint64_t obj, const char *sel, OV_Rect r)
+{
+    if (!r_is_objc_ptr(obj)) return;
+    r_msg2_main_raw(obj, sel, &r, sizeof(r), NULL, 0, NULL, 0, NULL, 0);
+}
 static void ov_set_text(uint64_t obj, const char *utf8)
 {
     if (!r_is_objc_ptr(obj) || !utf8) return;
@@ -128,76 +155,394 @@ static void ov_set_text(uint64_t obj, const char *utf8)
     r_dlsym_call(R_TIMEOUT, "CFRelease", str, 0, 0, 0, 0, 0, 0, 0);
 }
 
-static void ov_status(const char *fmt, ...)
+#pragma mark - 会话健康检查
+
+/* 动 objc 之前先确认远程内存通道是好的：读 8 字节 → 原值写回 → 再读，必须一致。
+   刻意不看 getpid：r_call_stable 对它有已知的偶发返回 0 特例。
+   读不到地址（可能不可映射）不下结论、继续；只有写失败/读回不一致才算坏。 */
+static bool ov_session_healthy(RemoteCall *proc, const char **why)
 {
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(gOvStatus, sizeof(gOvStatus), fmt, ap);
-    va_end(ap);
-    printf("(overlay) %s\n", gOvStatus);
+    bool conclusive_bad = false;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        r_settle_us(30000);
+        usleep(80 * 1000);
+
+        uint64_t addr = proc.trojanThreadAddr ? proc.trojanThreadAddr : proc.callThreadAddr;
+        if (addr < 0x1000ULL) { *why = "拿不到目标线程结构地址"; continue; }
+
+        uint64_t before = [proc remoteRead64From:addr];
+        if (before == 0) { *why = "远程读取返回 0（地址可能不可映射）"; continue; }
+        if (![proc remote_write64:addr value:before]) { *why = "远程写入失败"; conclusive_bad = true; continue; }
+        if ([proc remoteRead64From:addr] != before) { *why = "远程读回不一致"; conclusive_bad = true; continue; }
+
+        printf("(overlay) 健康检查 OK（addr=0x%llx）\n", addr);
+        fflush(stdout);
+        return true;
+    }
+    if (conclusive_bad) return false;
+    printf("(overlay) 健康检查无结论，按可用处理\n");
     fflush(stdout);
+    return true;
 }
 
-/* 整数参数（NSUInteger 等）走 raw 形态，返回 x0。 */
-static uint64_t ov_msg_int(uint64_t obj, const char *sel, long long value)
+#pragma mark - 投影
+
+typedef struct { double x, y, z; } OV_Vec3;
+
+static OV_Vec3 ov_sub(OV_Vec3 a, OV_Vec3 b) { OV_Vec3 r = {a.x-b.x, a.y-b.y, a.z-b.z}; return r; }
+static double ov_dot(OV_Vec3 a, OV_Vec3 b) { return a.x*b.x + a.y*b.y + a.z*b.z; }
+static OV_Vec3 ov_norm(OV_Vec3 a)
 {
-    if (!r_is_objc_ptr(obj)) return 0;
-    long long v = value;
-    return r_msg2_main_raw(obj, sel, &v, sizeof(v), NULL, 0, NULL, 0, NULL, 0);
+    double n = sqrt(ov_dot(a, a));
+    if (n < 1e-9) { OV_Vec3 z = {0,0,0}; return z; }
+    OV_Vec3 r = {a.x/n, a.y/n, a.z/n};
+    return r;
+}
+static OV_Vec3 ov_cross(OV_Vec3 a, OV_Vec3 b)
+{
+    OV_Vec3 r = {a.y*b.z - a.z*b.y, a.z*b.x - a.x*b.z, a.x*b.y - a.y*b.x};
+    return r;
 }
 
-/* 递归把一棵视图子树里的交互全关掉、手势识别器全禁用，返回处理数量。
-   参考实现（peace_esp，真机可用）画的是原生 UIView，全屏覆盖也不影响游戏操作；
-   我们唯一的差别是用 WKWebView —— 它内部会建 WKContentView / WKScrollView 并挂
-   一堆手势识别器，只关父视图的 userInteractionEnabled 未必能让整棵子树安静下来
-   （真机现象：覆盖区域把触摸吃掉）。所以这里逐个视图、逐个手势关下去。 */
-static int ov_disable_interaction_tree(uint64_t view, int depth)
+/* UE 厘米 -> 渲染世界（米，Z 朝上）：与主程序/网页一致 */
+static OV_Vec3 ov_ue_to_world(double x, double y, double z)
 {
-    if (!r_is_objc_ptr(view) || depth > 4) return 0;
-    int n = 0;
-    ov_set_bool(view, "setUserInteractionEnabled:", 0);
-    n++;
+    OV_Vec3 v = {x * 0.01, -y * 0.01, z * 0.01};
+    return v;
+}
 
-    uint64_t grs = r_msg2_main(view, "gestureRecognizers", 0, 0, 0, 0);
-    if (r_is_objc_ptr(grs)) {
-        uint64_t cnt = r_msg2_main(grs, "count", 0, 0, 0, 0) & 0xffff;
-        for (uint64_t i = 0; i < cnt && i < 16; i++) {
-            uint64_t gr = ov_msg_int(grs, "objectAtIndex:", (long long)i);
-            if (r_is_objc_ptr(gr)) { ov_set_bool(gr, "setEnabled:", 0); n++; }
+#pragma mark - 建窗与元素
+
+static void ov_screen_sides(double *longSide, double *shortSide)
+{
+    CGRect b = [UIScreen mainScreen].bounds;
+    double w = b.size.width, h = b.size.height;
+    if (w < 1.0 || h < 1.0) { w = 390.0; h = 844.0; }
+    *longSide = (w > h) ? w : h;
+    *shortSide = (w > h) ? h : w;
+}
+
+/* 面板区域：横屏/竖屏 + 全屏/面板 + 宽高比例，全部按真实分辨率算。 */
+static void ov_panel_rect(double *px, double *py, double *pw, double *ph)
+{
+    double L = 0, S = 0;
+    ov_screen_sides(&L, &S);
+    double W = gOvLandscape ? L : S;
+    double H = gOvLandscape ? S : L;
+
+    if (gOvFullscreen) {
+        *px = 0; *py = 0; *pw = W; *ph = H;
+        return;
+    }
+    double width = W * gOvWidthRatio;
+    if (width < 200.0) width = W * 0.92;
+    if (width > W) width = W;
+    double height = (gOvHeightRatio > 0.0) ? H * gOvHeightRatio : width * 9.0 / 16.0;
+    double maxH = H - gOvTop - 20.0;
+    if (height > maxH) height = maxH;
+    if (height < 60.0) height = 60.0;
+    *px = (W - width) / 2.0;
+    *py = gOvTop;
+    *pw = width;
+    *ph = height;
+}
+
+static uint64_t ov_make_view(uint64_t clsUIView, uint64_t clearColor, double borderWidth,
+                             uint64_t borderColor, OV_Rect frame)
+{
+    uint64_t alloc = r_msg2_main(clsUIView, "alloc", 0, 0, 0, 0);
+    uint64_t v = r_is_objc_ptr(alloc) ? r_msg2_main(alloc, "init", 0, 0, 0, 0) : 0;
+    if (!r_is_objc_ptr(v)) return 0;
+    if (r_is_objc_ptr(clearColor)) r_msg2_main(v, "setBackgroundColor:", clearColor, 0, 0, 0);
+    ov_set_bool(v, "setUserInteractionEnabled:", 0);
+    if (borderWidth > 0.0) {
+        uint64_t ly = r_msg2_main(v, "layer", 0, 0, 0, 0);
+        if (r_is_objc_ptr(ly)) {
+            ov_set_double(ly, "setBorderWidth:", borderWidth);
+            if (r_is_objc_ptr(borderColor)) r_msg2_main(ly, "setBorderColor:", borderColor, 0, 0, 0);
+        }
+    }
+    ov_set_rect(v, "setFrame:", frame);
+    ov_set_bool(v, "setHidden:", 1);
+    return v;
+}
+
+static uint64_t ov_make_label(uint64_t clsUILabel, uint64_t font, uint64_t textColor,
+                              uint64_t clearColor, int align, OV_Rect frame)
+{
+    uint64_t alloc = r_msg2_main(clsUILabel, "alloc", 0, 0, 0, 0);
+    uint64_t lb = r_is_objc_ptr(alloc) ? r_msg2_main(alloc, "init", 0, 0, 0, 0) : 0;
+    if (!r_is_objc_ptr(lb)) return 0;
+    if (r_is_objc_ptr(font)) r_msg2_main(lb, "setFont:", font, 0, 0, 0);
+    if (r_is_objc_ptr(textColor)) r_msg2_main(lb, "setTextColor:", textColor, 0, 0, 0);
+    if (r_is_objc_ptr(clearColor)) r_msg2_main(lb, "setBackgroundColor:", clearColor, 0, 0, 0);
+    ov_set_int(lb, "setTextAlignment:", align);
+    ov_set_int(lb, "setNumberOfLines:", 1);
+    ov_set_bool(lb, "setUserInteractionEnabled:", 0);
+    ov_set_rect(lb, "setFrame:", frame);
+    ov_set_bool(lb, "setHidden:", 1);
+    return lb;
+}
+
+/* 建整层：窗口 + 方框/名字/距离格子 + 准星。 */
+static bool ov_build(RemoteCall *proc)
+{
+    int step = 0;
+    arc_use_existing_remote_call((__bridge void *)proc);
+    r_settle_us(1500);
+    usleep(120 * 1000);          /* 让上一次调用彻底收尾，避免参数缓冲区交错 */
+
+    uint64_t clsApp   = r_class("UIApplication");
+    uint64_t clsWin   = r_class("UIWindow");
+    uint64_t clsColor = r_class("UIColor");
+    uint64_t clsView  = r_class("UIView");
+    uint64_t clsLabel = r_class("UILabel");
+    uint64_t clsFont  = r_class("UIFont");
+    step++;
+    ov_status("[%d/6] 类: app=0x%llx win=0x%llx view=0x%llx label=0x%llx",
+              step, clsApp, clsWin, clsView, clsLabel);
+    if (!r_is_objc_ptr(clsApp) || !r_is_objc_ptr(clsWin) ||
+        !r_is_objc_ptr(clsView) || !r_is_objc_ptr(clsLabel)) return false;
+
+    uint64_t app = r_msg2_main(clsApp, "sharedApplication", 0, 0, 0, 0);
+    step++;
+    ov_status("[%d/6] sharedApplication=0x%llx", step, app);
+    if (!r_is_objc_ptr(app)) return false;
+
+    uint64_t scenes = r_msg2_main(app, "connectedScenes", 0, 0, 0, 0);
+    uint64_t scene = r_is_objc_ptr(scenes) ? r_msg2_main(scenes, "anyObject", 0, 0, 0, 0) : 0;
+    step++;
+    ov_status("[%d/6] scene=0x%llx", step, scene);
+    if (!r_is_objc_ptr(scene)) return false;
+
+    double px = 0, py = 0, pw = 0, ph = 0;
+    ov_panel_rect(&px, &py, &pw, &ph);
+    OV_Rect full = {0, 0, pw + px * 2.0, ph + py * 2.0};   /* 覆盖整屏（按所选方向） */
+    if (gOvFullscreen) { full.x = 0; full.y = 0; full.w = pw; full.h = ph; }
+
+    uint64_t win = r_msg2_main(r_msg2_main(clsWin, "alloc", 0, 0, 0, 0), "initWithWindowScene:", scene, 0, 0, 0);
+    if (!r_is_objc_ptr(win)) { step++; ov_status("[%d/6] 窗口创建失败", step); return false; }
+    ov_set_double(win, "setWindowLevel:", OV_WINDOW_LEVEL);
+    ov_set_bool(win, "setUserInteractionEnabled:", 0);      /* 触摸穿透第一道 */
+    ov_set_bool(win, "setOpaque:", 0);
+    ov_set_rect(win, "setFrame:", full);
+    ov_set_int(win, "setTag:", (long long)OV_TAG);
+    uint64_t clear = r_is_objc_ptr(clsColor) ? r_msg2_main(clsColor, "clearColor", 0, 0, 0, 0) : 0;
+    if (r_is_objc_ptr(clear)) r_msg2_main(win, "setBackgroundColor:", clear, 0, 0, 0);
+    ov_set_bool(win, "setHidden:", 1);
+    step++;
+    ov_status("[%d/6] window=0x%llx 面板=%.0f,%.0f %.0fx%.0f 方向=%s%s",
+              step, win, px, py, pw, ph, gOvLandscape ? "横屏" : "竖屏", gOvFullscreen ? " 全屏" : "");
+
+    /* 字体/颜色 */
+    uint64_t font = 0;
+    if (r_is_objc_ptr(clsFont)) {
+        double fs = 11.0, wt = 0.6;
+        font = r_msg2_main_raw(clsFont, "systemFontOfSize:weight:",
+                               &fs, sizeof(fs), &wt, sizeof(wt), NULL, 0, NULL, 0);
+        if (!r_is_objc_ptr(font)) {
+            font = r_msg2_main_raw(clsFont, "systemFontOfSize:", &fs, sizeof(fs), NULL, 0, NULL, 0, NULL, 0);
+        }
+    }
+    uint64_t white = 0, red = 0, blue = 0, orange = 0;
+    if (r_is_objc_ptr(clsColor)) {
+        white  = r_msg2_main(clsColor, "whiteColor", 0, 0, 0, 0);
+        red    = r_msg2_main(clsColor, "systemRedColor", 0, 0, 0, 0);
+        blue   = r_msg2_main(clsColor, "systemBlueColor", 0, 0, 0, 0);
+        orange = r_msg2_main(clsColor, "systemOrangeColor", 0, 0, 0, 0);
+    }
+
+    /* 方框 + 名字 + 距离 */
+    int slots = gOvMaxSlots;
+    if (slots < 1) slots = 1;
+    if (slots > OV_MAX_SLOTS) slots = OV_MAX_SLOTS;
+    for (int i = 0; i < slots; i++) {
+        OV_Rect r0 = {0, 0, 0, 0};
+        uint64_t box = ov_make_view(clsView, clear, 2.0, red, r0);
+        if (!r_is_objc_ptr(box)) return false;
+        r_msg2_main(win, "addSubview:", box, 0, 0, 0);
+        gOvBox[i] = box;
+
+        OV_Rect r1 = {0, 0, 0, 0};
+        uint64_t nm = ov_make_label(clsLabel, font, white, clear, 1 /* center */, r1);
+        if (r_is_objc_ptr(nm)) r_msg2_main(win, "addSubview:", nm, 0, 0, 0);
+        gOvName[i] = nm;
+
+        OV_Rect r2 = {0, 0, 0, 0};
+        uint64_t ds = ov_make_label(clsLabel, font, white, clear, 1, r2);
+        if (r_is_objc_ptr(ds)) r_msg2_main(win, "addSubview:", ds, 0, 0, 0);
+        gOvDist[i] = ds;
+    }
+    gOvSlotsAllocated = slots;
+
+    /* 准星：两条细线，居中 */
+    {
+        double cx = pw / 2.0, cy = ph / 2.0;
+        OV_Rect h = {cx - 9.0, cy - 0.75, 18.0, 1.5};
+        OV_Rect v = {cx - 0.75, cy - 9.0, 1.5, 18.0};
+        gOvCrossH = ov_make_view(clsView, white, 0.0, 0, h);
+        gOvCrossV = ov_make_view(clsView, white, 0.0, 0, v);
+        if (r_is_objc_ptr(gOvCrossH)) r_msg2_main(win, "addSubview:", gOvCrossH, 0, 0, 0);
+        if (r_is_objc_ptr(gOvCrossV)) r_msg2_main(win, "addSubview:", gOvCrossV, 0, 0, 0);
+        ov_set_bool(gOvCrossH, "setHidden:", gOvShowCross ? 0 : 1);
+        ov_set_bool(gOvCrossV, "setHidden:", gOvShowCross ? 0 : 1);
+    }
+
+    ov_set_bool(win, "setHidden:", 0);
+    if (r_responds(win, "resignKeyWindow")) r_msg2_main(win, "resignKeyWindow", 0, 0, 0, 0);
+
+    uint64_t found = r_msg2_main(win, "viewWithTag:", (uint64_t)OV_TAG, 0, 0, 0);
+    uint64_t winUI = r_msg2_main(win, "isUserInteractionEnabled", 0, 0, 0, 0);
+    uint64_t winKey = r_msg2_main(win, "isKeyWindow", 0, 0, 0, 0);
+    step++;
+    ov_status("[%d/6] 就绪 tag=0x%llx(应为0x%llx) 格子=%d 窗口可交互=%u key=%u（都应是 0）",
+              step, found, win, slots, (unsigned)(winUI & 0xff), (unsigned)(winKey & 0xff));
+
+    gOvWindow = win;
+    gOvPid = proc.pid;
+    return r_is_objc_ptr(found) && found == win;
+}
+
+#pragma mark - 每帧绘制
+
+/* 解析一行快照并更新方框。返回画出来的方框数。 */
+static int ov_draw_snapshot(void)
+{
+    if (!r_is_objc_ptr(gOvWindow) || !gOvSnapFresh || !gOvSnap[0]) {
+        for (int i = 0; i < gOvSlotsAllocated; i++) {
+            if (r_is_objc_ptr(gOvBox[i])) ov_set_bool(gOvBox[i], "setHidden:", 1);
+            if (r_is_objc_ptr(gOvName[i])) ov_set_bool(gOvName[i], "setHidden:", 1);
+            if (r_is_objc_ptr(gOvDist[i])) ov_set_bool(gOvDist[i], "setHidden:", 1);
+        }
+        return 0;
+    }
+
+    double px = 0, py = 0, pw = 0, ph = 0;
+    ov_panel_rect(&px, &py, &pw, &ph);
+    if (pw < 8.0 || ph < 8.0) return 0;
+
+    /* 自己 */
+    char *p = gOvSnap;
+    double sx = 0, sy = 0, sz = 0, yaw = 0, pitch = 0;
+    if (sscanf(p, "%lf,%lf,%lf,%lf,%lf", &sx, &sy, &sz, &yaw, &pitch) != 5) return 0;
+    OV_Vec3 cam = ov_ue_to_world(sx, sy, sz);
+    cam.z += gOvEye;
+
+    double yr = -yaw * M_PI / 180.0;
+    double pr = pitch * M_PI / 180.0;
+    if (pr > 1.55) pr = 1.55;
+    if (pr < -1.55) pr = -1.55;
+    OV_Vec3 fwd = {cos(yr) * cos(pr), sin(yr) * cos(pr), sin(pr)};
+    OV_Vec3 up0 = {0, 0, 1};
+    OV_Vec3 right = ov_norm(ov_cross(fwd, up0));
+    OV_Vec3 up = ov_cross(right, fwd);
+
+    double tanHalfY = tan(gOvFov * M_PI / 360.0);
+    double aspect = pw / ph;
+
+    /* 跳到第一个 ';' 之后 */
+    char *semi = strchr(gOvSnap, ';');
+    if (!semi) return 0;
+    p = semi + 1;
+
+    int drawn = 0;
+    char *save = NULL;
+    for (char *tok = strtok_r(p, ";", &save); tok && drawn < gOvSlotsAllocated; tok = strtok_r(NULL, ";", &save)) {
+        double ex = 0, ey = 0, ez = 0;
+        int kind = 0;
+        if (sscanf(tok, "%lf,%lf,%lf,%d", &ex, &ey, &ez, &kind) != 4) continue;
+        OV_Vec3 w = ov_ue_to_world(ex, ey, ez);
+        w.z += OV_PERSON_HEIGHT * 0.5;                 /* 用身体中心对准方框中心 */
+
+        OV_Vec3 d = ov_sub(w, cam);
+        double depth = ov_dot(d, fwd);
+        if (depth < 0.5) continue;
+        double rx = ov_dot(d, right) / depth;
+        double ry = ov_dot(d, up) / depth;
+        if (fabs(rx) > tanHalfY * aspect * 1.6 || fabs(ry) > tanHalfY * 1.6) continue;
+
+        double cx = pw / 2.0 + rx * (pw / 2.0) / tanHalfY;
+        double cy = ph / 2.0 - ry * (ph / 2.0) / tanHalfY;
+
+        double boxH = OV_PERSON_HEIGHT / depth * (ph / 2.0) / tanHalfY;
+        if (boxH < OV_MIN_BOX_PX) boxH = OV_MIN_BOX_PX;
+        double boxW = boxH * 0.52;
+
+        int i = drawn++;
+        OV_Rect box = {cx - boxW / 2.0, cy - boxH / 2.0, boxW, boxH};
+        ov_set_rect(gOvBox[i], "setFrame:", box);
+        ov_set_bool(gOvBox[i], "setHidden:", 0);
+
+        char buf[OV_NAME_TEXT_MAX];
+        snprintf(buf, sizeof(buf), "%dm", (int)(depth + 0.5));
+        if (r_is_objc_ptr(gOvDist[i])) {
+            ov_set_text(gOvDist[i], buf);
+            OV_Rect dl = {cx - 40.0, cy + boxH / 2.0 + 2.0, 80.0, 14.0};
+            ov_set_rect(gOvDist[i], "setFrame:", dl);
+            ov_set_bool(gOvDist[i], "setHidden:", gOvShowDist ? 0 : 1);
         }
     }
 
-    uint64_t subs = r_msg2_main(view, "subviews", 0, 0, 0, 0);
-    if (r_is_objc_ptr(subs)) {
-        uint64_t cnt = r_msg2_main(subs, "count", 0, 0, 0, 0) & 0xffff;
-        for (uint64_t i = 0; i < cnt && i < 24; i++) {
-            uint64_t sv = ov_msg_int(subs, "objectAtIndex:", (long long)i);
-            n += ov_disable_interaction_tree(sv, depth + 1);
-        }
+    for (int i = drawn; i < gOvSlotsAllocated; i++) {
+        if (r_is_objc_ptr(gOvBox[i])) ov_set_bool(gOvBox[i], "setHidden:", 1);
+        if (r_is_objc_ptr(gOvName[i])) ov_set_bool(gOvName[i], "setHidden:", 1);
+        if (r_is_objc_ptr(gOvDist[i])) ov_set_bool(gOvDist[i], "setHidden:", 1);
     }
-    return n;
+    return drawn;
 }
 
-#pragma mark - Config (called from lara's process)
-
-void clock_overlay_set_url(const char *url)
+static void ov_tick(void)
 {
     pthread_mutex_lock(&gOvLock);
-    if (!url || !url[0]) {
-        strncpy(gOvUrl, OV_DEFAULT_URL, sizeof(gOvUrl) - 1);
-        gOvUrl[sizeof(gOvUrl) - 1] = '\0';
-    } else {
-        strncpy(gOvUrl, url, sizeof(gOvUrl) - 1);
-        gOvUrl[sizeof(gOvUrl) - 1] = '\0';
+    if (!gOvRunning) { pthread_mutex_unlock(&gOvLock); return; }
+
+    ov_log_mute();                 /* 帧内静音，避免 (rc)/(pac) 刷爆日志 */
+    int drawn = ov_draw_snapshot();
+    ov_log_unmute();
+
+    static unsigned tick = 0;
+    if (++tick % (OV_TICK_HZ * 5) == 0) {          /* 每 5 秒一行摘要 */
+        printf("(overlay) 绘制中：方框 %d 个，快照%s，状态：%s\n",
+               drawn, gOvSnapFresh ? "有" : "无", gOvStatus);
+        fflush(stdout);
     }
+    pthread_mutex_unlock(&gOvLock);
+}
+
+static void ov_start_timer(RemoteCall *proc)
+{
+    if (gOvTimer) return;
+    dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                                                 dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0));
+    if (!t) { printf("(overlay) 定时器创建失败\n"); fflush(stdout); return; }
+    dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, 0),
+                              OV_TICK_MS * NSEC_PER_MSEC, 2 * NSEC_PER_MSEC);
+    dispatch_source_set_event_handler(t, ^{ ov_tick(); });
+    gOvTimer = t;
+    dispatch_resume(gOvTimer);
+    (void)proc;
+}
+
+#pragma mark - Public API
+
+void clock_overlay_set_view(int maxSlots, double fovDeg, double eyeHeight,
+                            int showNames, int showDist, int showCross)
+{
+    pthread_mutex_lock(&gOvLock);
+    if (maxSlots > 0) gOvMaxSlots = (maxSlots > OV_MAX_SLOTS) ? OV_MAX_SLOTS : maxSlots;
+    if (fovDeg >= 40.0 && fovDeg <= 130.0) gOvFov = fovDeg;
+    if (eyeHeight >= 0.2 && eyeHeight <= 3.0) gOvEye = eyeHeight;
+    gOvShowNames = showNames ? 1 : 0;
+    gOvShowDist = showDist ? 1 : 0;
+    gOvShowCross = showCross ? 1 : 0;
     pthread_mutex_unlock(&gOvLock);
 }
 
 void clock_overlay_set_geometry(double widthRatio, double topMargin)
 {
     pthread_mutex_lock(&gOvLock);
-    gOvWidthRatio = (widthRatio >= 0.2 && widthRatio <= 1.0) ? widthRatio : OV_WEB_WIDTH_RATIO;
-    gOvTop = (topMargin >= 0.0 && topMargin <= 600.0) ? topMargin : OV_WEB_TOP;
+    gOvWidthRatio = (widthRatio >= 0.2 && widthRatio <= 1.0) ? widthRatio : 0.92;
+    gOvTop = (topMargin >= 0.0 && topMargin <= 600.0) ? topMargin : 56.0;
     pthread_mutex_unlock(&gOvLock);
 }
 
@@ -216,712 +561,93 @@ void clock_overlay_set_layout(int landscape, int fullscreen)
     pthread_mutex_unlock(&gOvLock);
 }
 
-/* 本机真实分辨率的“长边/短边”。本地读取：远程读 bounds 会把目标卡死。 */
-static void ov_screen_sides(double *longSide, double *shortSide)
-{
-    CGRect b = [UIScreen mainScreen].bounds;
-    double w = b.size.width, h = b.size.height;
-    if (w < 1.0 || h < 1.0) { w = 390.0; h = 844.0; }
-    *longSide = (w > h) ? w : h;
-    *shortSide = (w > h) ? h : w;
-}
-
-/* 当前内容（网页或胶囊）应该占的 frame：横屏把长短边对调，全屏铺满整屏。 */
-static CGRect ov_content_frame(void)
-{
-    double L = 0, S = 0;
-    ov_screen_sides(&L, &S);
-    double W = gOvLandscape ? L : S;          /* 目标进程的窗口空间跟随设备方向 */
-    double H = gOvLandscape ? S : L;
-
-    if (!gOvWebMode) {                        /* 退回方案：时间胶囊，居中靠顶 */
-        return CGRectMake((W - OV_PILL_WIDTH) / 2.0, gOvTop, OV_PILL_WIDTH, OV_PILL_HEIGHT);
-    }
-
-    if (gOvFullscreen) {
-        /* 方向不确定时最稳的做法：铺一个「长边 × 长边」的正方形覆盖整屏——
-           无论目标窗口空间是竖是横都被完全盖住，方向由页面自己旋转解决。 */
-        double side = (L > S) ? L : S;
-        double x = (W - side) / 2.0;
-        double y = (H - side) / 2.0;
-        return CGRectMake(x, y, side, side);
-    }
-
-    double width = W * gOvWidthRatio;
-    if (width < 200.0) width = W * OV_WEB_WIDTH_RATIO;
-    if (width > W) width = W;
-    double height;
-    if (gOvHeightRatio > 0.0) {
-        /* 指定了高度比例：做"顶部条/上半屏"用，宽高不再受 16:9 限制 */
-        height = H * gOvHeightRatio;
-    } else {
-        height = width * OV_WEB_ASPECT;
-    }
-    double maxHeight = H - gOvTop - 20.0;
-    if (height > maxHeight) height = maxHeight;
-    if (height < 60.0) height = 60.0;
-    return CGRectMake((W - width) / 2.0, gOvTop, width, height);
-}
-
-/* 把方向/全屏/尺寸变化应用到目标（只改 frame，页面不动）。 */
-static void ov_apply_layout(void)
-{
-    if (!r_is_objc_ptr(gOvWindow)) return;
-    double L = 0, S = 0;
-    ov_screen_sides(&L, &S);
-    double W = gOvLandscape ? L : S;
-    double H = gOvLandscape ? S : L;
-
-    CGRect win = CGRectMake(0, 0, W, H);
-    CGRect content = ov_content_frame();
-    r_msg2_main_raw(gOvWindow, "setFrame:", &win, sizeof(win), NULL, 0, NULL, 0, NULL, 0);
-    uint64_t target = gOvWebMode ? gOvWeb : gOvPill;
-    if (r_is_objc_ptr(target)) {
-        r_msg2_main_raw(target, "setFrame:", &content, sizeof(content), NULL, 0, NULL, 0, NULL, 0);
-    }
-    gOvAppliedLandscape = gOvLandscape;
-    gOvAppliedFullscreen = gOvFullscreen;
-    gOvAppliedW = W;
-    gOvAppliedH = H;
-    int io = ov_target_interface_orientation();
-    ov_status("布局已更新：设备=%s%s %.0fx%.0f → 内容 %.0f,%.0f %.0fx%.0f（目标窗口方向=%d，1竖2竖倒3横左4横右）",
-              gOvLandscape ? "横屏" : "竖屏", gOvFullscreen ? " 全屏" : "",
-              W, H, content.origin.x, content.origin.y, content.size.width, content.size.height, io);
-}
-
-const char *clock_overlay_url(void)
-{
-    return gOvUrl;
-}
-
-#pragma mark - 时间胶囊（退回方案）
-
-static NSDateFormatter *ov_formatter(void)
-{
-    static NSDateFormatter *fmt = nil;
-    if (!fmt) {
-        fmt = [[NSDateFormatter alloc] init];
-        fmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
-        fmt.dateFormat = @"HH:mm:ss";
-    }
-    return fmt;
-}
-
-/* Pushes the current time into the pill (main thread, one call per second).
-   Caller must hold gOvLock. */
-static void ov_push_text(void)
-{
-    if (!r_is_objc_ptr(gOvPill)) return;
-
-    const char *cstr = [ov_formatter() stringFromDate:[NSDate date]].UTF8String;
-    if (!cstr) return;
-    if (strncmp(cstr, gOvLastText, sizeof(gOvLastText)) == 0) return;
-
-    strncpy(gOvLastText, cstr, sizeof(gOvLastText) - 1);
-    gOvLastText[sizeof(gOvLastText) - 1] = '\0';
-
-    uint64_t str = r_nsstr_retained(cstr);          /* +1 in the target */
-    if (!r_is_objc_ptr(str)) return;
-    r_msg2_main(gOvPill, "setText:", str, 0, 0, 0);
-    r_dlsym_call(R_TIMEOUT, "CFRelease", str, 0, 0, 0, 0, 0, 0, 0);
-}
-
-#pragma mark - 第一视角网页（主方案）
-
-/* 让 WKWebView 加载 gOvUrl（可在主线程之外调用，内部用的都是 r_msg2_main*）。
-   Caller must hold gOvLock. */
-static void ov_load_url(void)
-{
-    if (!r_is_objc_ptr(gOvWeb) || !gOvUrl[0]) return;
-
-    uint64_t clsNSURL = r_class("NSURL");
-    uint64_t clsReq   = r_class("NSURLRequest");
-    if (!r_is_objc_ptr(clsNSURL) || !r_is_objc_ptr(clsReq)) {
-        ov_status("网页失败：找不到 NSURL/NSURLRequest");
-        return;
-    }
-
-    uint64_t str = r_nsstr_retained(gOvUrl);
-    if (!r_is_objc_ptr(str)) { ov_status("网页失败：地址字符串创建失败"); return; }
-
-    uint64_t nsurl = r_msg2_main(clsNSURL, "URLWithString:", str, 0, 0, 0);
-    r_dlsym_call(R_TIMEOUT, "CFRelease", str, 0, 0, 0, 0, 0, 0, 0);
-    if (!r_is_objc_ptr(nsurl)) { ov_status("网页失败：URL 解析失败（%s）", gOvUrl); return; }
-
-    uint64_t req = r_msg2_main(clsReq, "requestWithURL:", nsurl, 0, 0, 0);
-    if (!r_is_objc_ptr(req)) { ov_status("网页失败：NSURLRequest 创建失败"); return; }
-
-    r_msg2_main(gOvWeb, "loadRequest:", req, 0, 0, 0);
-    strncpy(gOvUrlLoaded, gOvUrl, sizeof(gOvUrlLoaded) - 1);
-    gOvUrlLoaded[sizeof(gOvUrlLoaded) - 1] = '\0';
-    ov_status("第一视角已加载：%s", gOvUrl);
-}
-
-/* 建 WKWebView；失败返回 0。 */
-static uint64_t ov_build_web(RemoteCall *proc, CGRect screen, CGRect frame)
-{
-    uint64_t clsWeb = r_class("WKWebView");
-    uint64_t clsCfg = r_class("WKWebViewConfiguration");
-    if (!r_is_objc_ptr(clsWeb) || !r_is_objc_ptr(clsCfg)) {
-        printf("(overlay) 目标进程没有 WKWebView（web=0x%llx cfg=0x%llx），改用时间胶囊\n",
-               clsWeb, clsCfg);
-        fflush(stdout);
-        return 0;
-    }
-
-    uint64_t cfgAlloc = r_msg2_main(clsCfg, "alloc", 0, 0, 0, 0);
-    uint64_t cfg = r_is_objc_ptr(cfgAlloc) ? r_msg2_main(cfgAlloc, "init", 0, 0, 0, 0) : 0;
-    if (!r_is_objc_ptr(cfg)) { ov_status("网页失败：WKWebViewConfiguration 创建失败"); return 0; }
-
-    uint64_t webAlloc = r_msg2_main(clsWeb, "alloc", 0, 0, 0, 0);
-    if (!r_is_objc_ptr(webAlloc)) { ov_status("网页失败：WKWebView alloc 失败"); return 0; }
-
-    /* initWithFrame:configuration: —— 结构体 + 对象指针一起走 raw 形态 */
-    uint64_t cfgVal = cfg;
-    uint64_t web = r_msg2_main_raw(webAlloc, "initWithFrame:configuration:",
-                                   &frame, sizeof(frame), &cfgVal, sizeof(cfgVal),
-                                   NULL, 0, NULL, 0);
-    if (!r_is_objc_ptr(web)) { ov_status("网页失败：WKWebView init 失败"); return 0; }
-
-    /* 外观与行为：整层透明（只留网页画的方框/文字/准星）、不可滚动、不吃触摸 */
-    uint64_t clsColor = r_class("UIColor");
-    uint64_t clear = 0;
-    if (r_is_objc_ptr(clsColor)) clear = r_msg2_main(clsColor, "clearColor", 0, 0, 0, 0);
-    if (r_is_objc_ptr(clear)) {
-        r_msg2_main(web, "setBackgroundColor:", clear, 0, 0, 0);
-        /* WKWebView 自带的底色在这几个地方，不清掉就会出现一块黑/白底挡着游戏 */
-        if (r_responds(web, "setUnderPageBackgroundColor:")) {
-            r_msg2_main(web, "setUnderPageBackgroundColor:", clear, 0, 0, 0);
-        }
-    }
-    ov_set_bool(web, "setOpaque:", 0);
-    ov_set_bool(web, "setUserInteractionEnabled:", 0);
-    ov_set_bool(web, "setMultipleTouchEnabled:", 0);
-    uint64_t scroll = r_msg2_main(web, "scrollView", 0, 0, 0, 0);
-    if (r_is_objc_ptr(scroll)) {
-        /* 触摸穿透 + 透明：窗口 + 网页 + 内部滚动视图全部关掉交互与底色，
-           命中测试会直接跳过整棵子树，手指全部落到下面的游戏里。 */
-        ov_set_bool(scroll, "setUserInteractionEnabled:", 0);
-        if (r_is_objc_ptr(clear)) r_msg2_main(scroll, "setBackgroundColor:", clear, 0, 0, 0);
-        ov_set_bool(scroll, "setScrollEnabled:", 0);
-        ov_set_bool(scroll, "setBounces:", 0);
-        ov_set_bool(scroll, "setShowsVerticalScrollIndicator:", 0);
-        ov_set_bool(scroll, "setShowsHorizontalScrollIndicator:", 0);
-    }
-    uint64_t layer = r_msg2_main(web, "layer", 0, 0, 0, 0);
-    if (r_is_objc_ptr(layer)) {
-        double radius = 14.0;
-        r_msg2_main_raw(layer, "setCornerRadius:", &radius, sizeof(radius), NULL, 0, NULL, 0, NULL, 0);
-        ov_set_bool(layer, "setMasksToBounds:", 1);
-    }
-    double opacity = 0.96;
-    r_msg2_main_raw(web, "setAlpha:", &opacity, sizeof(opacity), NULL, 0, NULL, 0, NULL, 0);
-    ov_set_int(web, "setTag:", (long long)(OV_TAG));
-    (void)proc;
-    (void)screen;
-
-    gOvWeb = web;
-    gOvWebMode = true;
-    ov_load_url();
-    return web;
-}
-
-/* 建时间胶囊；失败返回 0。 */
-static uint64_t ov_build_pill(CGRect screen, CGRect frame)
-{
-    uint64_t clsLabel = r_class("UILabel");
-    uint64_t clsColor = r_class("UIColor");
-    uint64_t clsFont  = r_class("UIFont");
-    if (!r_is_objc_ptr(clsLabel)) { ov_status("胶囊失败：找不到 UILabel"); return 0; }
-
-    uint64_t allocatedLabel = r_msg2_main(clsLabel, "alloc", 0, 0, 0, 0);
-    uint64_t pill = r_is_objc_ptr(allocatedLabel) ? r_msg2_main(allocatedLabel, "init", 0, 0, 0, 0) : 0;
-    if (!r_is_objc_ptr(pill)) { ov_status("胶囊失败：UILabel init 失败"); return 0; }
-
-    double fontSize = OV_PILL_FONT;
-    uint64_t font = r_is_objc_ptr(clsFont)
-        ? r_msg2_main_raw(clsFont, "systemFontOfSize:", &fontSize, sizeof(fontSize), NULL, 0, NULL, 0, NULL, 0)
-        : 0;
-    if (r_is_objc_ptr(font)) r_msg2_main(pill, "setFont:", font, 0, 0, 0);
-    r_msg2_main(pill, "setTextAlignment:", 1 /* centre */, 0, 0, 0);
-    ov_set_int(pill, "setNumberOfLines:", (long long)(1));
-    ov_set_bool(pill, "setClipsToBounds:", 1);
-    if (r_is_objc_ptr(clsColor)) {
-        uint64_t white = r_msg2_main(clsColor, "whiteColor", 0, 0, 0, 0);
-        uint64_t black = r_msg2_main(clsColor, "blackColor", 0, 0, 0, 0);
-        if (r_is_objc_ptr(white)) r_msg2_main(pill, "setTextColor:", white, 0, 0, 0);
-        if (r_is_objc_ptr(black)) r_msg2_main(pill, "setBackgroundColor:", black, 0, 0, 0);
-    }
-    uint64_t layer = r_msg2_main(pill, "layer", 0, 0, 0, 0);
-    if (r_is_objc_ptr(layer)) {
-        double radius = OV_PILL_RADIUS;
-        r_msg2_main_raw(layer, "setCornerRadius:", &radius, sizeof(radius), NULL, 0, NULL, 0, NULL, 0);
-    }
-    r_msg2_main_raw(pill, "setFrame:", &frame, sizeof(frame), NULL, 0, NULL, 0, NULL, 0);
-    ov_set_int(pill, "setTag:", (long long)(OV_TAG));
-    (void)screen;
-
-    gOvPill = pill;
-    gOvWebMode = false;
-    ov_push_text();
-    return pill;
-}
-
-/* 在 lara 自己的主线程上轮询设备方向：不依赖 UIDevice 通知。
-   原因：游戏运行时 lara 在后台，方向变化通知经常收不到，浮层就会一直停在
-   进 3D 那一刻的竖屏判断上（真机现象：界面横屏了，悬浮层不跟）。 */
-static void ov_poll_orientation(void)
-{
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIDeviceOrientation o = [UIDevice currentDevice].orientation;
-        if (o == UIDeviceOrientationLandscapeLeft || o == UIDeviceOrientationLandscapeRight) {
-            gOvLandscape = 1;
-        } else if (o == UIDeviceOrientationPortrait || o == UIDeviceOrientationPortraitUpsideDown) {
-            gOvLandscape = 0;
-        }
-        /* unknown / faceUp / faceDown：沿用上一次判断 */
-    });
-}
-
-/* 问目标进程：它的窗口空间现在是什么方向（1竖 2竖倒 3横左 4横右，-1 未知）。
-   这是唯一可信的方向信号：lara 在后台时 UIDevice.orientation 常报 unknown/竖屏，
-   网页里的 screen.orientation.angle 跟的又是接口方向 —— 两者都解释不了真机上
-   “界面横屏了、悬浮层一直竖着”。SpringBoard 自己的 interfaceOrientation 会跟设备转。 */
-static int ov_target_interface_orientation(void)
-{
-    uint64_t clsApp = r_class("UIApplication");
-    if (!r_is_objc_ptr(clsApp)) return -1;
-    uint64_t app = r_msg2_main(clsApp, "sharedApplication", 0, 0, 0, 0);
-    if (!r_is_objc_ptr(app)) return -1;
-    uint64_t scenes = r_msg2_main(app, "connectedScenes", 0, 0, 0, 0);
-    uint64_t scene = r_is_objc_ptr(scenes) ? r_msg2_main(scenes, "anyObject", 0, 0, 0, 0) : 0;
-    if (!r_is_objc_ptr(scene)) return -1;
-    uint64_t io = r_msg2_main(scene, "interfaceOrientation", 0, 0, 0, 0);
-    return (int)(io & 0xff);
-}
-
-/* 用目标窗口方向当权威判断；拿不到时才退回设备方向。 */
-static bool ov_refresh_landscape(void)
-{
-    int io = ov_target_interface_orientation();
-    if (io == 3 || io == 4) { gOvLandscape = 1; return true; }
-    if (io == 1 || io == 2) { gOvLandscape = 0; return true; }
-    return false;                      /* 未知：交给设备方向兜底 */
-}
-
-#pragma mark - Ticking
-
-static void ov_tick(void)
+void clock_overlay_set_snapshot(const char *compact)
 {
     pthread_mutex_lock(&gOvLock);
-    if (!gOvRunning) { pthread_mutex_unlock(&gOvLock); return; }
-
-    if (gOvWebMode) {
-        /* 每秒比对一次地址：主进程改了偏好就热重载，不用重启 lara */
-        if (++gOvTick >= OV_URL_CHECK_TICKS) {
-            gOvTick = 0;
-            if (strncmp(gOvUrl, gOvUrlLoaded, sizeof(gOvUrl)) != 0) {
-                printf("(overlay) 地址变化：%s -> %s，重新加载\n", gOvUrlLoaded, gOvUrl);
-                fflush(stdout);
-                ov_load_url();
-            }
-        }
+    if (!compact || !compact[0]) {
+        gOvSnap[0] = '\0';
+        gOvSnapFresh = false;
     } else {
-        ov_push_text();
-    }
-
-    /* 方向由用户在设置里手选（横屏/竖屏），这里不再自动判断：
-       真机上无论是 lara 的 UIDevice.orientation（后台常报 unknown/竖屏）还是
-       页面的 screen.orientation.angle（跟接口方向），都不足以可靠判断，
-       所以直接听用户的设置，只按 gOvLandscape 重排。 */
-
-    /* 方向（横竖屏）、全屏开关、分辨率变化：只重设 frame，页面不重建。 */
-    double L = 0, S = 0;
-    ov_screen_sides(&L, &S);
-    double W = gOvLandscape ? L : S;
-    double H = gOvLandscape ? S : L;
-    if (gOvAppliedLandscape != gOvLandscape || gOvAppliedFullscreen != gOvFullscreen
-        || gOvAppliedW != W || gOvAppliedH != H) {
-        ov_apply_layout();
-    }
-
-    /* 触摸穿透自愈：iOS 有时会重建窗口内部视图、把交互重新打开，
-       而一个 999999 层级、全屏的窗口一旦变回“可交互”，就会把游戏的手指全吃掉
-       （真机现象：桌面和 lara 能点、别的游戏点不动）。
-       注意频率：每次远程调用都会往日志写十几行 (rc)/(pac)，所以这里 30 秒才查一次，
-       而且只在读回值真的不对时才动手，避免把日志刷爆、影响排障。 */
-    if (++gOvGuard >= 120) {                       /* 120 * 250ms = 30s */
-        gOvGuard = 0;
-        uint64_t winUI = r_msg2_main(gOvWindow, "isUserInteractionEnabled", 0, 0, 0, 0);
-        if ((winUI & 0xff) != 0) {
-            printf("(overlay) 警告：窗口又变成可交互（winUI=%u），再次关闭\n",
-                   (unsigned)(winUI & 0xff));
-            fflush(stdout);
-            ov_set_bool(gOvWindow, "setUserInteractionEnabled:", 0);
-            if (r_is_objc_ptr(gOvWeb)) ov_set_bool(gOvWeb, "setUserInteractionEnabled:", 0);
-        }
-    }
-
-    /* WKWebView 的内部视图（WKContentView / WKScrollView）是异步建出来的：
-       建好后 2 秒再整棵子树关一遍交互与手势，这是"覆盖区域吃触摸"的关键修复。 */
-    if (gOvWebMode && r_is_objc_ptr(gOvWeb) && gOvTreeWalked < 8 && ++gOvTreeWalked == 8) {
-        int nd = ov_disable_interaction_tree(gOvWeb, 0);
-        printf("(overlay) 补一次网页子树交互关闭：%d 个视图/手势\n", nd);
-        fflush(stdout);
-    }
-
-    /* 网页加载失败兜底：全透明之后，一个加载不出来的 WKWebView 就是“什么都看不见”，
-       用户只会觉得没生效。所以发现长时间没加载完就把原生提示条显示出来（带地址与原因）。 */
-    if (gOvWebMode && r_is_objc_ptr(gOvWeb)) {
-        uint64_t loading = r_msg2_main(gOvWeb, "isLoading", 0, 0, 0, 0);
-        if ((loading & 0xff) != 0) {
-            if (gOvWebWait++ == 24) {              /* 24 * 250ms = 6s 还没好 */
-                printf("(overlay) 网页 6 秒仍未加载完成，显示原生提示（地址：%s）\n", gOvUrl);
-                fflush(stdout);
-                if (r_is_objc_ptr(gOvPill)) {
-                    ov_set_bool(gOvPill, "setHidden:", 0);
-                    ov_set_text(gOvPill, "第一视角：连不上电脑服务");
-                }
-            }
-        } else if (gOvWebWait) {
-            gOvWebWait = 0;
-            if (r_is_objc_ptr(gOvPill)) ov_set_bool(gOvPill, "setHidden:", 1);
-        }
+        strncpy(gOvSnap, compact, sizeof(gOvSnap) - 1);
+        gOvSnap[sizeof(gOvSnap) - 1] = '\0';
+        gOvSnapFresh = true;
     }
     pthread_mutex_unlock(&gOvLock);
 }
 
-static void ov_start_timer(RemoteCall *proc)
+void clock_overlay_set_url(const char *url)
 {
-    if (gOvTimer) return;
-
-    dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
-                                                     dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0));
-    if (!timer) {
-        printf("(overlay) 定时器创建失败\n");
-        fflush(stdout);
-        return;
-    }
-    dispatch_source_set_timer(timer,
-                              dispatch_time(DISPATCH_TIME_NOW, 0),
-                              OV_TICK_MS * NSEC_PER_MSEC,
-                              100 * NSEC_PER_MSEC);
-    dispatch_source_set_event_handler(timer, ^{
-        ov_tick();
-    });
-    gOvTimer = timer;
-    dispatch_resume(gOvTimer);
-    (void)proc;
+    pthread_mutex_lock(&gOvLock);
+    if (!url) gOvUrl[0] = '\0';
+    else { strncpy(gOvUrl, url, sizeof(gOvUrl) - 1); gOvUrl[sizeof(gOvUrl) - 1] = '\0'; }
+    pthread_mutex_unlock(&gOvLock);
 }
 
-#pragma mark - 会话健康检查
-
-/* 远程会话自检：在碰任何 objc 类之前，先确认远程内存通道是好的。
-   判据只用 RemoteCall 自己的 vm 通道（真机日志里一直稳定）：
-     取目标线程结构地址 → 读 8 字节 → 把原值写回 → 再读，必须一致。
-   不碰 objc、不分配内存、不改动目标状态。
-   刻意不看 getpid：r_call_stable 对 getpid 有已知的偶发返回 0 特例
-   （RemoteCall.m 里就专门处理过），拿它当判据会误判成“会话坏了”。
-   读不到地址（可能不可映射）时不下结论、继续建浮层——只有“写失败/读回不一致”
-   才认定通道坏了并放弃。 */
-static bool ov_session_healthy(RemoteCall *proc, const char **why)
-{
-    bool conclusive_bad = false;
-
-    for (int attempt = 0; attempt < 3; attempt++) {
-        /* 让上一次调用彻底回收，避免和残留的调用交错 */
-        r_settle_us(30000);
-        usleep(80 * 1000);
-
-        uint64_t addr = proc.trojanThreadAddr ? proc.trojanThreadAddr : proc.callThreadAddr;
-        if (addr < 0x1000ULL) {
-            *why = "拿不到目标线程结构地址";
-            printf("(overlay) 健康检查[%d]：线程地址无效\n", attempt);
-            fflush(stdout);
-            continue;
-        }
-
-        uint64_t before = [proc remoteRead64From:addr];
-        if (before == 0) {
-            *why = "远程读取返回 0（该地址可能不可映射）";
-            printf("(overlay) 健康检查[%d]：读不到 0x%llx\n", attempt, addr);
-            fflush(stdout);
-            continue;                      /* 不下结论 */
-        }
-        if (![proc remote_write64:addr value:before]) {
-            *why = "远程写入失败";
-            printf("(overlay) 健康检查[%d]：写 0x%llx 失败\n", attempt, addr);
-            fflush(stdout);
-            conclusive_bad = true;
-            continue;
-        }
-        if ([proc remoteRead64From:addr] != before) {
-            *why = "远程读回不一致";
-            printf("(overlay) 健康检查[%d]：0x%llx 读回不一致\n", attempt, addr);
-            fflush(stdout);
-            conclusive_bad = true;
-            continue;
-        }
-
-        printf("(overlay) 健康检查[%d]：远程内存通道 OK（addr=0x%llx value=0x%llx）\n",
-               attempt, addr, before);
-        fflush(stdout);
-        return true;
-    }
-
-    if (conclusive_bad) return false;
-    printf("(overlay) 健康检查无结论（三次都读不到线程结构），按可用处理，继续建浮层\n");
-    fflush(stdout);
-    return true;
-}
-
-#pragma mark - Build
-
-/* Numbered steps, printed as we go: the last line in lara.log is the last call
-   that came back alive. */
-static bool ov_build(RemoteCall *proc)
-{
-    int step = 0;
-
-    /* Point remote_objc's global helpers at lara's live SpringBoard session. */
-    arc_use_existing_remote_call((__bridge void *)proc);
-    r_settle_us(1500);
-    /* 参数缓冲区是全局共享的：开工前留一点时间让上一次调用彻底收尾，
-       否则两次远程调用同时在飞会让 malloc 返回垃圾指针 → 目标进程崩溃。 */
-    usleep(120 * 1000);
-
-    /* 1/6 — classes. */
-    uint64_t clsApplication = r_class("UIApplication");
-    uint64_t clsWindow      = r_class("UIWindow");
-    uint64_t clsColor       = r_class("UIColor");
-    step++;
-    ov_status("[%d/6] 类: app=0x%llx win=0x%llx color=0x%llx",
-              step, clsApplication, clsWindow, clsColor);
-    if (!r_is_objc_ptr(clsApplication) || !r_is_objc_ptr(clsWindow)) return false;
-
-    /* 2/6 — application object. */
-    uint64_t app = r_msg2_main(clsApplication, "sharedApplication", 0, 0, 0, 0);
-    step++;
-    ov_status("[%d/6] sharedApplication=0x%llx", step, app);
-    if (!r_is_objc_ptr(app)) return false;
-
-    /* 3/6 — the scene to host the window on. */
-    uint64_t scenes = r_msg2_main(app, "connectedScenes", 0, 0, 0, 0);
-    uint64_t scene = r_is_objc_ptr(scenes) ? r_msg2_main(scenes, "anyObject", 0, 0, 0, 0) : 0;
-    step++;
-    ov_status("[%d/6] connectedScenes=0x%llx scene=0x%llx", step, scenes, scene);
-    if (!r_is_objc_ptr(scene)) return false;
-
-    /* 4/6 — our own high-level window. Screen geometry is local (see header). */
-    CGRect screen = [UIScreen mainScreen].bounds;
-    if (screen.size.width < 1.0 || screen.size.height < 1.0) screen = CGRectMake(0, 0, 390, 844);
-
-    uint64_t allocatedWindow = r_msg2_main(clsWindow, "alloc", 0, 0, 0, 0);
-    uint64_t window = r_is_objc_ptr(allocatedWindow)
-        ? r_msg2_main(allocatedWindow, "initWithWindowScene:", scene, 0, 0, 0)
-        : 0;
-    if (!r_is_objc_ptr(window)) {
-        step++;
-        ov_status("[%d/6] 窗口创建失败 allocated=0x%llx", step, allocatedWindow);
-        return false;
-    }
-
-    double level = OV_WINDOW_LEVEL;
-    r_msg2_main_raw(window, "setWindowLevel:", &level, sizeof(level), NULL, 0, NULL, 0, NULL, 0);
-    ov_set_bool(window, "setUserInteractionEnabled:", 0);
-    ov_set_bool(window, "setOpaque:", 0);
-    if (r_is_objc_ptr(clsColor)) {
-        uint64_t clear = r_msg2_main(clsColor, "clearColor", 0, 0, 0, 0);
-        if (r_is_objc_ptr(clear)) r_msg2_main(window, "setBackgroundColor:", clear, 0, 0, 0);
-    }
-    r_msg2_main_raw(window, "setFrame:", &screen, sizeof(screen), NULL, 0, NULL, 0, NULL, 0);
-    ov_set_bool(window, "setHidden:", 1);
-
-    /* 建之前先把用户选的方向读进来（设置里手选横屏/竖屏），开局就对。
-       顺便问一次目标窗口方向写进日志，仅用于诊断。 */
-    int io0 = ov_target_interface_orientation();
-    printf("(overlay) 用户选择方向=%s（目标窗口方向=%d，1竖2竖倒3横左4横右）\n",
-           gOvLandscape ? "横屏" : "竖屏", io0);
-    fflush(stdout);
-    gOvWebMode = true;
-    CGRect webFrame = ov_content_frame();
-    gOvWebMode = false;
-    CGRect pillFrame = ov_content_frame();
-
-    uint64_t web = ov_build_web(proc, screen, webFrame);
-    bool webOk = r_is_objc_ptr(web);
-    /* 提示条始终建好（网页模式下先隐藏）：网页加载不出来时它显形，
-       否则全透明的浮层什么都看不见，用户只会觉得“没生效”。 */
-    uint64_t pill = ov_build_pill(screen, pillFrame);
-    if (r_is_objc_ptr(pill) && webOk) {
-        /* 两个视图都带 OV_TAG 会让 viewWithTag: 返回上面的提示条，校验就会误判成失败 */
-        ov_set_int(pill, "setTag:", (long long)(OV_TAG + 1));
-    }
-    gOvWebMode = webOk;
-    uint64_t content = webOk ? web : pill;
-    step++;
-    ov_status("[%d/6] content=0x%llx web=%d frame=%.0f,%.0f %.0fx%.0f 触摸穿透=开 url=%s",
-              step, content, gOvWebMode ? 1 : 0,
-              webFrame.origin.x, webFrame.origin.y, webFrame.size.width, webFrame.size.height, gOvUrl);
-    if (!r_is_objc_ptr(content)) return false;
-
-    /* 6/6 — attach, show, verify. */
-    if (webOk && r_is_objc_ptr(pill)) {
-        /* 网页在下、提示条在上；提示条默认隐藏，只在网页失败时显形 */
-        r_msg2_main(window, "addSubview:", web, 0, 0, 0);
-        r_msg2_main(window, "addSubview:", pill, 0, 0, 0);
-        ov_set_bool(pill, "setHidden:", 1);
-        ov_set_text(pill, "第一视角：连接电脑服务中…");
-    } else {
-        r_msg2_main(window, "addSubview:", content, 0, 0, 0);
-    }
-    ov_set_bool(window, "setHidden:", 0);
-    ov_set_bool(content, "setHidden:", 0);
-    if (r_is_objc_ptr(gOvWeb)) ov_set_bool(gOvWeb, "setHidden:", 0);
-    /* 关键：WKWebView 的子树是它自己建的，且可能稍后才建好 ——
-       这里立刻关一遍，tick 里 2 秒后再补一遍（见 gOvTreeWalked）。 */
-    if (r_is_objc_ptr(gOvWeb)) {
-        int nd = ov_disable_interaction_tree(gOvWeb, 0);
-        printf("(overlay) 已关闭网页子树交互：%d 个视图/手势\n", nd);
-        fflush(stdout);
-    }
-    /* 别让浮层窗口成为 key window：key 窗口在系统层面更容易拿到输入焦点。
-       （触摸穿透仍以 userInteractionEnabled=0 为主，这里是第二道保险。） */
-    if (r_responds(window, "resignKeyWindow")) {
-        r_msg2_main(window, "resignKeyWindow", 0, 0, 0, 0);
-    }
-
-    uint64_t found = r_msg2_main(window, "viewWithTag:", (uint64_t)OV_TAG, 0, 0, 0);
-    /* 回读校验：触摸穿透靠的就是这几个值必须是 0，日志里直接写出结果 */
-    uint64_t winUI = r_msg2_main(window, "isUserInteractionEnabled", 0, 0, 0, 0);
-    uint64_t webUI = r_is_objc_ptr(gOvWeb) ? r_msg2_main(gOvWeb, "isUserInteractionEnabled", 0, 0, 0, 0) : 0;
-    uint64_t winKey = r_msg2_main(window, "isKeyWindow", 0, 0, 0, 0);
-    step++;
-    ov_status("[%d/6] 校验 tag=0x%llx(应为0x%llx) 内容=%s 窗口可交互=%u 网页可交互=%u 窗口是key=%u（前三个都应是 0）",
-              step, found, content, gOvWebMode ? "第一视角" : "时间胶囊",
-              (unsigned)(winUI & 0xff), (unsigned)(webUI & 0xff), (unsigned)(winKey & 0xff));
-
-    gOvWindow = window;
-    gOvPid = proc.pid;
-    /* 记录当前布局，之后方向/全屏变化时 tick 会自己重排 */
-    gOvAppliedLandscape = -1;
-    ov_apply_layout();
-    return r_is_objc_ptr(found) && found == content;
-}
-
-#pragma mark - Public API
+const char *clock_overlay_url(void) { return gOvUrl; }
+const char *clock_overlay_status(void) { return gOvStatus; }
+bool clock_overlay_is_running(void) { return gOvRunning; }
+bool clock_overlay_failed(void) { return gOvFailed; }
 
 bool clock_overlay_start(RemoteCall *proc)
 {
-    if (!proc) {
-        ov_status("RemoteCall 为空：请先在首页初始化远程调用");
-        return false;
-    }
+    if (!proc) { ov_status("RemoteCall 为空：请先在首页初始化远程调用"); return false; }
 
     pthread_mutex_lock(&gOvLock);
-
-    if (gOvRunning) {
-        pthread_mutex_unlock(&gOvLock);
-        return true;
-    }
-    /* 上一次已经把远程会话弄坏了：绝不再自动重试（要重试请按「自检」）。 */
-    if (gOvFailed) {
-        pthread_mutex_unlock(&gOvLock);
-        return false;
-    }
-    /* 单飞：同一时刻只允许一次构建，避免两次远程调用同时在飞。 */
-    if (gOvBuilding) {
-        pthread_mutex_unlock(&gOvLock);
-        return false;
-    }
+    if (gOvRunning) { pthread_mutex_unlock(&gOvLock); return true; }
+    if (gOvFailed) { pthread_mutex_unlock(&gOvLock); return false; }   /* 失败闩锁，需自检解开 */
+    if (gOvBuilding) { pthread_mutex_unlock(&gOvLock); return false; } /* 单飞 */
     gOvBuilding = true;
     pthread_mutex_unlock(&gOvLock);
 
-    /* 动 objc 之前先探一探会话是否健康（不健康就什么都不做，目标进程活着）。 */
-    const char *why = "未知原因";
+    const char *why = "未知";
     if (!ov_session_healthy(proc, &why)) {
         pthread_mutex_lock(&gOvLock);
-        gOvBuilding = false;
-        gOvFailed = true;
+        gOvBuilding = false; gOvFailed = true;
         pthread_mutex_unlock(&gOvLock);
-        ov_status("已放弃：远程会话不健康（%s）。目标进程未受影响；修好后按「自检」重试。", why);
+        ov_status("已放弃：远程会话不健康（%s）", why);
         return false;
     }
 
-    pthread_mutex_lock(&gOvLock);
-
-    /* Still alive in the same target? Just show it again. */
-    uint64_t existing = r_is_objc_ptr(gOvWeb) ? gOvWeb : gOvPill;
-    if (gOvPid == proc.pid && r_is_objc_ptr(existing) && r_is_objc_ptr(gOvWindow)) {
+    /* 已有对象就直接显示回来 */
+    if (gOvPid == proc.pid && r_is_objc_ptr(gOvWindow)) {
         uint64_t found = r_msg2_main(gOvWindow, "viewWithTag:", (uint64_t)OV_TAG, 0, 0, 0);
-        if (found == existing) {
+        if (found == gOvWindow) {
+            pthread_mutex_lock(&gOvLock);
             ov_set_bool(gOvWindow, "setHidden:", 0);
-            ov_set_bool(existing, "setHidden:", 0);
-            gOvRunning = true;
-            if (gOvWebMode && strncmp(gOvUrl, gOvUrlLoaded, sizeof(gOvUrl)) != 0) ov_load_url();
-            if (!gOvWebMode) { gOvLastText[0] = '\0'; ov_push_text(); }
+            gOvRunning = true; gOvBuilding = false;
             ov_start_timer(proc);
-            ov_status("复用已有浮层：window=0x%llx content=0x%llx(%s)",
-                      gOvWindow, existing, gOvWebMode ? "第一视角" : "时间胶囊");
-            gOvBuilding = false;
             pthread_mutex_unlock(&gOvLock);
+            ov_status("复用已有浮层：window=0x%llx", gOvWindow);
             return true;
         }
     }
 
     gOvWindow = 0;
-    gOvPill = 0;
-    gOvWeb = 0;
-    gOvLastText[0] = '\0';
-    gOvUrlLoaded[0] = '\0';
+    for (int i = 0; i < OV_MAX_SLOTS; i++) { gOvBox[i] = gOvName[i] = gOvDist[i] = 0; }
+    gOvSlotsAllocated = 0;
 
-    bool attached = ov_build(proc);
+    pthread_mutex_lock(&gOvLock);
+    bool ok = ov_build(proc);
     gOvBuilding = false;
-    if (!attached) {
-        /* ov_build printed the last step it reached. 会话很可能已被破坏 → 上锁不再重试 */
-        gOvFailed = true;
-        pthread_mutex_unlock(&gOvLock);
-        return false;
-    }
-
-    gOvRunning = true;
-    ov_start_timer(proc);
-    ov_status("已显示：%s window=0x%llx content=0x%llx url=%s",
-              gOvWebMode ? "第一视角" : "时间胶囊", gOvWindow,
-              gOvWebMode ? gOvWeb : gOvPill, gOvUrl);
-
+    if (!ok) gOvFailed = true;
+    if (ok) { gOvRunning = true; ov_start_timer(proc); }
     pthread_mutex_unlock(&gOvLock);
-    return true;
-}
-
-bool clock_overlay_failed(void)
-{
-    return gOvFailed;
+    return ok;
 }
 
 bool clock_overlay_selftest(RemoteCall *proc)
 {
-    if (!proc) {
-        ov_status("自检失败：RemoteCall 为空");
-        return false;
-    }
+    if (!proc) { ov_status("自检失败：RemoteCall 为空"); return false; }
 
-    /* Clean slate, so the numbered steps below tell the whole story. */
     pthread_mutex_lock(&gOvLock);
     gOvRunning = false;
-    gOvFailed = false;                 /* 用户显式重试：解开失败闩锁 */
-    if (gOvTimer) {
-        dispatch_source_cancel(gOvTimer);
-        gOvTimer = nil;
-    }
-    if (r_is_objc_ptr(gOvWeb)) ov_set_bool(gOvWeb, "setHidden:", 1);
-    if (r_is_objc_ptr(gOvPill)) ov_set_bool(gOvPill, "setHidden:", 1);
+    gOvFailed = false;                       /* 用户显式重试：解开失败闩锁 */
+    if (gOvTimer) { dispatch_source_cancel(gOvTimer); gOvTimer = nil; }
+    if (r_is_objc_ptr(gOvWindow)) ov_set_bool(gOvWindow, "setHidden:", 1);
     gOvWindow = 0;
-    gOvPill = 0;
-    gOvWeb = 0;
-    gOvWebMode = false;
-    gOvLastText[0] = '\0';
-    gOvUrlLoaded[0] = '\0';
+    for (int i = 0; i < OV_MAX_SLOTS; i++) { gOvBox[i] = gOvName[i] = gOvDist[i] = 0; }
+    gOvCrossH = gOvCrossV = 0;
+    gOvSlotsAllocated = 0;
     pthread_mutex_unlock(&gOvLock);
 
     printf("(overlay) === 自检开始 ===\n");
@@ -932,39 +658,15 @@ bool clock_overlay_selftest(RemoteCall *proc)
 void clock_overlay_stop(RemoteCall *proc)
 {
     (void)proc;
-
     pthread_mutex_lock(&gOvLock);
-
     gOvRunning = false;
-    if (gOvTimer) {
-        dispatch_source_cancel(gOvTimer);
-        gOvTimer = nil;
-    }
-
-    if (r_is_objc_ptr(gOvWeb)) ov_set_bool(gOvWeb, "setHidden:", 1);
-    if (r_is_objc_ptr(gOvPill)) ov_set_bool(gOvPill, "setHidden:", 1);
+    if (gOvTimer) { dispatch_source_cancel(gOvTimer); gOvTimer = nil; }
     if (r_is_objc_ptr(gOvWindow)) ov_set_bool(gOvWindow, "setHidden:", 1);
-    gOvLastText[0] = '\0';
     ov_status("已隐藏（对象保留，可直接再次开启）");
-
     pthread_mutex_unlock(&gOvLock);
-}
-
-bool clock_overlay_is_running(void)
-{
-    /* Status flag only: read without the lock so a slow tick can never block
-       the caller (a stale read here is harmless). */
-    return gOvRunning;
-}
-
-const char *clock_overlay_status(void)
-{
-    return gOvStatus;
 }
 
 void clock_overlay_unbind(void)
 {
-    /* lara is destroying the RemoteCall session; drop the global binding so a
-       later start cannot talk to the destroyed object. */
     abandon_remote_call();
 }
