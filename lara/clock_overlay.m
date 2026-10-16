@@ -94,6 +94,22 @@ static int gOvAppliedFullscreen = -1;
 static double gOvAppliedW = 0;
 static double gOvAppliedH = 0;
 
+/* BOOL / NSInteger 参数必须走 raw 形态按字节传：
+   用 r_msg2_main(obj, sel, 0, ...) 传标量时，参数会被当成“对象”，目标侧实际
+   收到垃圾值（真机表现＝ setUserInteractionEnabled: 没生效，全屏浮层把触摸全吃掉）。 */
+static void ov_set_bool(uint64_t obj, const char *sel, bool value)
+{
+    if (!r_is_objc_ptr(obj)) return;
+    signed char v = value ? 1 : 0;
+    r_msg2_main_raw(obj, sel, &v, sizeof(v), NULL, 0, NULL, 0, NULL, 0);
+}
+static void ov_set_int(uint64_t obj, const char *sel, long long value)
+{
+    if (!r_is_objc_ptr(obj)) return;
+    long long v = value;
+    r_msg2_main_raw(obj, sel, &v, sizeof(v), NULL, 0, NULL, 0, NULL, 0);
+}
+
 static void ov_status(const char *fmt, ...)
 {
     va_list ap;
@@ -303,29 +319,29 @@ static uint64_t ov_build_web(RemoteCall *proc, CGRect screen, CGRect frame)
             r_msg2_main(web, "setUnderPageBackgroundColor:", clear, 0, 0, 0);
         }
     }
-    r_msg2_main(web, "setOpaque:", 0, 0, 0, 0);
-    r_msg2_main(web, "setUserInteractionEnabled:", 0, 0, 0, 0);
-    r_msg2_main(web, "setMultipleTouchEnabled:", 0, 0, 0, 0);
+    ov_set_bool(web, "setOpaque:", 0);
+    ov_set_bool(web, "setUserInteractionEnabled:", 0);
+    ov_set_bool(web, "setMultipleTouchEnabled:", 0);
     uint64_t scroll = r_msg2_main(web, "scrollView", 0, 0, 0, 0);
     if (r_is_objc_ptr(scroll)) {
         /* 触摸穿透 + 透明：窗口 + 网页 + 内部滚动视图全部关掉交互与底色，
            命中测试会直接跳过整棵子树，手指全部落到下面的游戏里。 */
-        r_msg2_main(scroll, "setUserInteractionEnabled:", 0, 0, 0, 0);
+        ov_set_bool(scroll, "setUserInteractionEnabled:", 0);
         if (r_is_objc_ptr(clear)) r_msg2_main(scroll, "setBackgroundColor:", clear, 0, 0, 0);
-        r_msg2_main(scroll, "setScrollEnabled:", 0, 0, 0, 0);
-        r_msg2_main(scroll, "setBounces:", 0, 0, 0, 0);
-        r_msg2_main(scroll, "setShowsVerticalScrollIndicator:", 0, 0, 0, 0);
-        r_msg2_main(scroll, "setShowsHorizontalScrollIndicator:", 0, 0, 0, 0);
+        ov_set_bool(scroll, "setScrollEnabled:", 0);
+        ov_set_bool(scroll, "setBounces:", 0);
+        ov_set_bool(scroll, "setShowsVerticalScrollIndicator:", 0);
+        ov_set_bool(scroll, "setShowsHorizontalScrollIndicator:", 0);
     }
     uint64_t layer = r_msg2_main(web, "layer", 0, 0, 0, 0);
     if (r_is_objc_ptr(layer)) {
         double radius = 14.0;
         r_msg2_main_raw(layer, "setCornerRadius:", &radius, sizeof(radius), NULL, 0, NULL, 0, NULL, 0);
-        r_msg2_main(layer, "setMasksToBounds:", 1, 0, 0, 0);
+        ov_set_bool(layer, "setMasksToBounds:", 1);
     }
     double opacity = 0.96;
     r_msg2_main_raw(web, "setAlpha:", &opacity, sizeof(opacity), NULL, 0, NULL, 0, NULL, 0);
-    r_msg2_main(web, "setTag:", (uint64_t)OV_TAG, 0, 0, 0);
+    ov_set_int(web, "setTag:", (long long)(OV_TAG));
     (void)proc;
     (void)screen;
 
@@ -353,8 +369,8 @@ static uint64_t ov_build_pill(CGRect screen, CGRect frame)
         : 0;
     if (r_is_objc_ptr(font)) r_msg2_main(pill, "setFont:", font, 0, 0, 0);
     r_msg2_main(pill, "setTextAlignment:", 1 /* centre */, 0, 0, 0);
-    r_msg2_main(pill, "setNumberOfLines:", 1, 0, 0, 0);
-    r_msg2_main(pill, "setClipsToBounds:", 1, 0, 0, 0);
+    ov_set_int(pill, "setNumberOfLines:", (long long)(1));
+    ov_set_bool(pill, "setClipsToBounds:", 1);
     if (r_is_objc_ptr(clsColor)) {
         uint64_t white = r_msg2_main(clsColor, "whiteColor", 0, 0, 0, 0);
         uint64_t black = r_msg2_main(clsColor, "blackColor", 0, 0, 0, 0);
@@ -367,7 +383,7 @@ static uint64_t ov_build_pill(CGRect screen, CGRect frame)
         r_msg2_main_raw(layer, "setCornerRadius:", &radius, sizeof(radius), NULL, 0, NULL, 0, NULL, 0);
     }
     r_msg2_main_raw(pill, "setFrame:", &frame, sizeof(frame), NULL, 0, NULL, 0, NULL, 0);
-    r_msg2_main(pill, "setTag:", (uint64_t)OV_TAG, 0, 0, 0);
+    ov_set_int(pill, "setTag:", (long long)(OV_TAG));
     (void)screen;
 
     gOvPill = pill;
@@ -546,14 +562,14 @@ static bool ov_build(RemoteCall *proc)
 
     double level = OV_WINDOW_LEVEL;
     r_msg2_main_raw(window, "setWindowLevel:", &level, sizeof(level), NULL, 0, NULL, 0, NULL, 0);
-    r_msg2_main(window, "setUserInteractionEnabled:", 0, 0, 0, 0);
-    r_msg2_main(window, "setOpaque:", 0, 0, 0, 0);
+    ov_set_bool(window, "setUserInteractionEnabled:", 0);
+    ov_set_bool(window, "setOpaque:", 0);
     if (r_is_objc_ptr(clsColor)) {
         uint64_t clear = r_msg2_main(clsColor, "clearColor", 0, 0, 0, 0);
         if (r_is_objc_ptr(clear)) r_msg2_main(window, "setBackgroundColor:", clear, 0, 0, 0);
     }
     r_msg2_main_raw(window, "setFrame:", &screen, sizeof(screen), NULL, 0, NULL, 0, NULL, 0);
-    r_msg2_main(window, "setHidden:", 1, 0, 0, 0);
+    ov_set_bool(window, "setHidden:", 1);
 
     /* 5/6 — content: 第一视角网页优先，失败退回时间胶囊。
        frame 按当前方向/全屏/真实分辨率算（见 ov_content_frame）。 */
@@ -574,13 +590,17 @@ static bool ov_build(RemoteCall *proc)
 
     /* 6/6 — attach, show, verify. */
     r_msg2_main(window, "addSubview:", content, 0, 0, 0);
-    r_msg2_main(window, "setHidden:", 0, 0, 0, 0);
-    r_msg2_main(content, "setHidden:", 0, 0, 0, 0);
+    ov_set_bool(window, "setHidden:", 0);
+    ov_set_bool(content, "setHidden:", 0);
 
     uint64_t found = r_msg2_main(window, "viewWithTag:", (uint64_t)OV_TAG, 0, 0, 0);
+    /* 回读校验：触摸穿透靠的就是这几个值必须是 0，日志里直接写出结果 */
+    uint64_t winUI = r_msg2_main(window, "isUserInteractionEnabled", 0, 0, 0, 0);
+    uint64_t webUI = r_is_objc_ptr(gOvWeb) ? r_msg2_main(gOvWeb, "isUserInteractionEnabled", 0, 0, 0, 0) : 0;
     step++;
-    ov_status("[%d/6] 校验 tag=0x%llx(应为0x%llx) 内容=%s",
-              step, found, content, gOvWebMode ? "第一视角" : "时间胶囊");
+    ov_status("[%d/6] 校验 tag=0x%llx(应为0x%llx) 内容=%s 窗口可交互=%u 网页可交互=%u（都应是 0）",
+              step, found, content, gOvWebMode ? "第一视角" : "时间胶囊",
+              (unsigned)(winUI & 0xff), (unsigned)(webUI & 0xff));
 
     gOvWindow = window;
     gOvPid = proc.pid;
@@ -636,8 +656,8 @@ bool clock_overlay_start(RemoteCall *proc)
     if (gOvPid == proc.pid && r_is_objc_ptr(existing) && r_is_objc_ptr(gOvWindow)) {
         uint64_t found = r_msg2_main(gOvWindow, "viewWithTag:", (uint64_t)OV_TAG, 0, 0, 0);
         if (found == existing) {
-            r_msg2_main(gOvWindow, "setHidden:", 0, 0, 0, 0);
-            r_msg2_main(existing, "setHidden:", 0, 0, 0, 0);
+            ov_set_bool(gOvWindow, "setHidden:", 0);
+            ov_set_bool(existing, "setHidden:", 0);
             gOvRunning = true;
             if (gOvWebMode && strncmp(gOvUrl, gOvUrlLoaded, sizeof(gOvUrl)) != 0) ov_load_url();
             if (!gOvWebMode) { gOvLastText[0] = '\0'; ov_push_text(); }
@@ -695,8 +715,8 @@ bool clock_overlay_selftest(RemoteCall *proc)
         dispatch_source_cancel(gOvTimer);
         gOvTimer = nil;
     }
-    if (r_is_objc_ptr(gOvWeb)) r_msg2_main(gOvWeb, "setHidden:", 1, 0, 0, 0);
-    if (r_is_objc_ptr(gOvPill)) r_msg2_main(gOvPill, "setHidden:", 1, 0, 0, 0);
+    if (r_is_objc_ptr(gOvWeb)) ov_set_bool(gOvWeb, "setHidden:", 1);
+    if (r_is_objc_ptr(gOvPill)) ov_set_bool(gOvPill, "setHidden:", 1);
     gOvWindow = 0;
     gOvPill = 0;
     gOvWeb = 0;
@@ -722,9 +742,9 @@ void clock_overlay_stop(RemoteCall *proc)
         gOvTimer = nil;
     }
 
-    if (r_is_objc_ptr(gOvWeb)) r_msg2_main(gOvWeb, "setHidden:", 1, 0, 0, 0);
-    if (r_is_objc_ptr(gOvPill)) r_msg2_main(gOvPill, "setHidden:", 1, 0, 0, 0);
-    if (r_is_objc_ptr(gOvWindow)) r_msg2_main(gOvWindow, "setHidden:", 1, 0, 0, 0);
+    if (r_is_objc_ptr(gOvWeb)) ov_set_bool(gOvWeb, "setHidden:", 1);
+    if (r_is_objc_ptr(gOvPill)) ov_set_bool(gOvPill, "setHidden:", 1);
+    if (r_is_objc_ptr(gOvWindow)) ov_set_bool(gOvWindow, "setHidden:", 1);
     gOvLastText[0] = '\0';
     ov_status("已隐藏（对象保留，可直接再次开启）");
 
