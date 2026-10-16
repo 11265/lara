@@ -292,20 +292,26 @@ static uint64_t ov_build_web(RemoteCall *proc, CGRect screen, CGRect frame)
                                    NULL, 0, NULL, 0);
     if (!r_is_objc_ptr(web)) { ov_status("网页失败：WKWebView init 失败"); return 0; }
 
-    /* 外观与行为：透明底、不可滚动、不吃触摸（浮层不能挡住游戏操作） */
+    /* 外观与行为：整层透明（只留网页画的方框/文字/准星）、不可滚动、不吃触摸 */
     uint64_t clsColor = r_class("UIColor");
-    if (r_is_objc_ptr(clsColor)) {
-        uint64_t clear = r_msg2_main(clsColor, "clearColor", 0, 0, 0, 0);
-        if (r_is_objc_ptr(clear)) r_msg2_main(web, "setBackgroundColor:", clear, 0, 0, 0);
+    uint64_t clear = 0;
+    if (r_is_objc_ptr(clsColor)) clear = r_msg2_main(clsColor, "clearColor", 0, 0, 0, 0);
+    if (r_is_objc_ptr(clear)) {
+        r_msg2_main(web, "setBackgroundColor:", clear, 0, 0, 0);
+        /* WKWebView 自带的底色在这几个地方，不清掉就会出现一块黑/白底挡着游戏 */
+        if (r_responds(web, "setUnderPageBackgroundColor:")) {
+            r_msg2_main(web, "setUnderPageBackgroundColor:", clear, 0, 0, 0);
+        }
     }
-    r_msg2_main(web, "setUserInteractionEnabled:", 0, 0, 0, 0);
     r_msg2_main(web, "setOpaque:", 0, 0, 0, 0);
+    r_msg2_main(web, "setUserInteractionEnabled:", 0, 0, 0, 0);
     r_msg2_main(web, "setMultipleTouchEnabled:", 0, 0, 0, 0);
     uint64_t scroll = r_msg2_main(web, "scrollView", 0, 0, 0, 0);
     if (r_is_objc_ptr(scroll)) {
-        /* 触摸穿透：窗口 + 网页 + 内部滚动视图全部关掉交互，
+        /* 触摸穿透 + 透明：窗口 + 网页 + 内部滚动视图全部关掉交互与底色，
            命中测试会直接跳过整棵子树，手指全部落到下面的游戏里。 */
         r_msg2_main(scroll, "setUserInteractionEnabled:", 0, 0, 0, 0);
+        if (r_is_objc_ptr(clear)) r_msg2_main(scroll, "setBackgroundColor:", clear, 0, 0, 0);
         r_msg2_main(scroll, "setScrollEnabled:", 0, 0, 0, 0);
         r_msg2_main(scroll, "setBounces:", 0, 0, 0, 0);
         r_msg2_main(scroll, "setShowsVerticalScrollIndicator:", 0, 0, 0, 0);
