@@ -15,8 +15,17 @@ import Foundation
 import Darwin
 import Combine
 import SwiftUI
+import os.log
 
 let globallogger = Logger()
+
+/// 把 lara 的关键日志镜像到统一日志，这样在电脑上用 idevicesyslog 就能实时看到，
+/// 不必再从手机里拷 Documents/lara.log（那个受 UIFileSharing 影响、也不跨重启）。
+/// 只镜像显式 log() 调用，不镜像 stdout 里成吨的 (rc) 刷屏，避免拖慢主线程。
+private let laradiag = OSLog(subsystem: "com.roooot.lara", category: "diag")
+private func lara_oslog(_ message: String) {
+    os_log("%{public}@", log: laradiag, type: .default, message)
+}
 
 class Logger: ObservableObject {
     @Published var logs: [String] = []
@@ -134,6 +143,7 @@ class Logger: ObservableObject {
 
         appendtofile([message])
         emit(message)
+        lara_oslog(message)
     }
 
     func divider() {

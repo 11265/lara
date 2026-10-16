@@ -9,6 +9,7 @@
 
 import SwiftUI
 import UniformTypeIdentifiers
+import Darwin
 
 enum taboptions {
     case applying, clock, logs
@@ -29,6 +30,13 @@ struct lara: App {
         #if DEBUG
         weonadebugbuild_pjbweouttahereexclamationmark = true
         #endif
+
+        // 关键：忽略 SIGPIPE。Logger 把 stdout 接到管道上，切后台/重定向时若
+        // 另一端被关掉，任何还在写日志的线程都会收到 SIGPIPE——默认动作是**直接
+        // 杀死进程**，而且不留崩溃报告。lara 一死，SpringBoard 里挂着的木马线程
+        // 就没人应答，裸崩在 PC=0x401 → 桌面重开。忽略 SIGPIPE 后写入只会返回
+        // EPIPE，绝不致命。
+        _ = signal(SIGPIPE, SIG_IGN)
 
         // fix file picker
         let fixMethod = class_getInstanceMethod(UIDocumentPickerViewController.self, #selector(UIDocumentPickerViewController.fix_init(forOpeningContentTypes:asCopy:)))!
@@ -95,13 +103,17 @@ struct lara: App {
     private func handleScenePhase(_ phase: ScenePhase) {
         switch phase {
         case .inactive, .background:
+            // 注意：这里【不要】再 globallogger.stopcapture()。切后台那一刻浮层/远程
+            // 调用线程还在往 stdout 打印，(rc) 刷屏量极大；此时把日志管道拆掉，
+            // 并发的 printf 会踩到已关闭的 fd。保留管道、持续采集，既避开这个竞态，
+            // 也让日志能完整记录到崩溃前一刻。
             handlebg()
-            globallogger.stopcapture()
 
         case .active:
             globallogger.capture()
-            // 回到前台：确保悬浮第一视角还在
-            if mgr.rcready && !mgr.clockrunning {
+            // 回到前台：只有用户确实是「开」的状态才确保浮层在；用户主动关掉后
+            // （fpvOn=false）不要再自动把它拉起来。
+            if mgr.fpvOn && mgr.rcready && !mgr.clockrunning {
                 mgr.startClock()
             }
 

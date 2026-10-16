@@ -86,7 +86,11 @@ final class laramgr: ObservableObject {
     @Published var fpvOn: Bool = false              // 「开启」开关的真实状态（唯一驱动源）
 
     var sbProc: RemoteCall?
-    var ytProc = RemoteCall(process: "youtube", useMigFilterBypass: false)
+    // 注意：这里以前有个 `var ytProc = RemoteCall(process: "youtube")` 的成员初始化。
+    // 它会在 laramgr 单例构造时（也就是 app 一启动、漏洞原语尚未就绪时）立刻去
+    // proc_find_by_name / 读内核内存，属于未初始化就读内核——极可能就是那次内核
+    // panic（"Unexpected fault in kernel static region"）的元凶。而且它全程没被用到，
+    // 已删除。
 
     static let shared = laramgr()
     static let fontpath = "/System/Library/Fonts/Core/SFUI.ttf"
@@ -913,11 +917,14 @@ final class laramgr: ObservableObject {
         }
     }
 
-    /// 「关闭」：停浮层 + 销毁远程调用。
+    /// 「关闭」：停浮层。**不拆远程会话。**
+    /// 拆会话（rcdestroy → mach_port_destruct）时，SpringBoard 里那个挂着的木马
+    /// 线程一旦在 0x401 收到异常却没人应答，就会 SIGBUS，整个 SpringBoard 重开——
+    /// 这正是「开一次关一次桌面就重开」的来源。会话随 lara 进程存活即可，代价是
+    /// 强制退出 lara 时 SpringBoard 会注销一次（设置页已就此提醒）。
     func disableAll() {
         fpvOn = false
         stopClock()
-        if rcready { rcdestroy() }
     }
 
     /// 强制重建悬浮窗并逐步骤写日志（第一视角页的「重新自检并显示」按钮）。
