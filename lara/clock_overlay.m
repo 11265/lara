@@ -72,6 +72,42 @@ static const char *kClockSecureSelectors[] = {
 };
 #define CLOCK_SECURE_SELECTOR_COUNT (sizeof(kClockSecureSelectors) / sizeof(kClockSecureSelectors[0]))
 
+/* Screenshot and screen-recording handling lives in SpringBoard under one of
+   these names, depending on the iOS build. Whatever exists gets enumerated, so
+   lara.log always shows the real API of the device it ran on. */
+static const char *kCaptureClassNames[] = {
+    /* screenshots */
+    "SBScreenShotService",
+    "SBScreenShotManager",
+    "SBScreenshotManager",
+    "SBScreenCaptureService",
+    "SBScreenShotUIService",
+    /* screen recording */
+    "SBRecordingService",
+    "SBScreenRecordingService",
+    "SBRecordingManager",
+    "SBScreenRecordingManager",
+    "SBScreenRecordingIndicatorManager",
+    "SBScreenRecordingAssertion",
+    /* mirroring */
+    "SBScreenMirroringService",
+    "SBAirPlayMirroringService",
+    "SBExternalDisplayService",
+    /* control center record button */
+    "CCUIScreenRecordingModuleViewController",
+    "CCUIScreenRecordingModule",
+};
+#define CLOCK_CAPTURE_CLASS_COUNT (sizeof(kCaptureClassNames) / sizeof(kCaptureClassNames[0]))
+
+/* A selector is a block candidate when its name looks like a capture action. */
+static const char *kCaptureKeywords[] = {
+    "creenshot", "creencapture", "ecord", "irroring",
+};
+#define CLOCK_CAPTURE_KEYWORD_COUNT (sizeof(kCaptureKeywords) / sizeof(kCaptureKeywords[0]))
+
+#define CLOCK_CAPTURE_MAX_METHODS 96
+#define CLOCK_CAPTURE_MAX_BLOCKED 12
+
 #pragma mark - State
 
 static pthread_mutex_t gClockLock = PTHREAD_MUTEX_INITIALIZER;
@@ -206,6 +242,132 @@ static void clock_start_timer(RemoteCall *proc)
 }
 
 #pragma mark - Build
+
+/* ---------------------------------------------------------------------------
+   Global capture blocking: screenshots, screen recording and mirroring.
+
+   For every candidate service class that exists in SpringBoard, walk its method
+   list. A method is neutralised only when all of these hold:
+     * its name looks like a capture action (screenshot / screen-capture /
+       record / mirroring);
+     * it is not wiring or UI (setter / is-getter / has / can / should /
+       observer / notification / delegate / will / did / indicator / view /
+       controller / assertion);
+     * its type encoding says it returns void — the replacement IMP is
+       -[NSObject class], which takes no arguments and has no side effects, so a
+       void caller cannot tell the difference while the action never runs.
+   Every candidate and every skip reason is printed, so if this heuristic misses a
+   build, lara.log still contains the real selector names for the next round.
+
+   Uses the same remote primitives rc.m uses for its own method patches:
+   class_copyMethodList / method_getName / sel_getName / method_getTypeEncoding /
+   method_getImplementation / method_setImplementation.
+   --------------------------------------------------------------------------- */
+int clock_overlay_block_capture(RemoteCall *proc)
+{
+    if (!proc) {
+        clock_status("阻止截屏失败：RemoteCall 为空");
+        return 0;
+    }
+
+    pthread_mutex_lock(&gClockLock);
+
+    uint64_t clsNSObject = remote_getClass(proc, "NSObject");
+    uint64_t noopImp = 0;
+    if (r_is_objc_ptr(clsNSObject)) {
+        uint64_t selClass = remote_sel(proc, "class");
+        uint64_t method = RemoteArbCall(proc, class_getInstanceMethod, clsNSObject, selClass);
+        if (method) noopImp = RemoteArbCall(proc, method_getImplementation, method);
+    }
+    if (!noopImp) {
+        pthread_mutex_unlock(&gClockLock);
+        clock_status("阻止截屏：拿不到空实现，未做任何修改");
+        return 0;
+    }
+
+    printf("(clock) === 全局阻止截屏 ===\n");
+    fflush(stdout);
+
+    int blocked = 0;
+    for (size_t c = 0; c < CLOCK_CAPTURE_CLASS_COUNT; c++) {
+        uint64_t cls = remote_getClass(proc, kCaptureClassNames[c]);
+        if (!r_is_objc_ptr(cls)) {
+            printf("(clock)   类 %s：不存在\n", kCaptureClassNames[c]);
+            fflush(stdout);
+            continue;
+        }
+
+        uint64_t countPtr = RemoteArbCall(proc, malloc, (uint64_t)sizeof(uint32_t));
+        if (!countPtr) continue;
+        uint64_t list = RemoteArbCall(proc, class_copyMethodList, cls, countPtr);
+        uint32_t count = 0;
+        if (list) [proc remoteRead:countPtr to:&count size:sizeof(count)];
+        if (count > CLOCK_CAPTURE_MAX_METHODS) count = CLOCK_CAPTURE_MAX_METHODS;
+        printf("(clock)   类 %s：0x%llx，%u 个方法\n", kCaptureClassNames[c], cls, count);
+        fflush(stdout);
+
+        for (uint32_t i = 0; list && i < count; i++) {
+            uint64_t method = 0;
+            if (![proc remoteRead:list + (uint64_t)i * 8 to:&method size:sizeof(method)] || !method) continue;
+
+            uint64_t sel = RemoteArbCall(proc, method_getName, method);
+            uint64_t namePtr = sel ? RemoteArbCall(proc, sel_getName, sel) : 0;
+            if (!namePtr) continue;
+            char name[128] = {0};
+            if (![proc remoteRead:namePtr to:name size:sizeof(name) - 1]) continue;
+
+            bool looksLikeCapture = false;
+            for (size_t k = 0; k < CLOCK_CAPTURE_KEYWORD_COUNT && !looksLikeCapture; k++) {
+                looksLikeCapture = (strstr(name, kCaptureKeywords[k]) != NULL);
+            }
+            if (!looksLikeCapture) continue;
+
+            printf("(clock)     候选 %s\n", name);
+            fflush(stdout);
+
+            if (strncmp(name, "set", 3) == 0 || strncmp(name, "is", 2) == 0 ||
+                strncmp(name, "has", 3) == 0 || strncmp(name, "can", 3) == 0 ||
+                strncmp(name, "should", 6) == 0 ||
+                strstr(name, "Observer") || strstr(name, "Notification") ||
+                strstr(name, "delegate") || strstr(name, "Delegate") ||
+                strstr(name, "will") || strstr(name, "did") ||
+                strstr(name, "Indicator") || strstr(name, "ViewController") ||
+                strstr(name, "View") || strstr(name, "Window") ||
+                strstr(name, "Assertion")) {
+                printf("(clock)       跳过：属于装配/通知/界面而非动作\n");
+                fflush(stdout);
+                continue;
+            }
+
+            uint64_t encPtr = RemoteArbCall(proc, method_getTypeEncoding, method);
+            char enc[32] = {0};
+            if (!encPtr || ![proc remoteRead:encPtr to:enc size:sizeof(enc) - 1]) continue;
+            if (enc[0] != 'v') {
+                printf("(clock)       跳过：返回类型 '%c'（非 void）\n", enc[0]);
+                fflush(stdout);
+                continue;
+            }
+
+            if (blocked >= CLOCK_CAPTURE_MAX_BLOCKED) {
+                printf("(clock)       跳过：已达上限 %d\n", CLOCK_CAPTURE_MAX_BLOCKED);
+                fflush(stdout);
+                continue;
+            }
+
+            RemoteArbCall(proc, method_setImplementation, method, noopImp);
+            blocked++;
+            printf("(clock)       → 已置为空实现（该截屏动作会被吞掉）\n");
+            fflush(stdout);
+        }
+
+        if (countPtr) RemoteArbCall(proc, free, countPtr);
+        if (list) RemoteArbCall(proc, free, list);
+    }
+
+    clock_status("全局防录屏/防截屏：已吞掉 %d 个捕获动作（候选与跳过原因见日志）", blocked);
+    pthread_mutex_unlock(&gClockLock);
+    return blocked;
+}
 
 /* Numbered steps, printed as we go: the last line in lara.log is the last call
    that came back alive. */
@@ -418,6 +580,12 @@ bool clock_overlay_start(RemoteCall *proc)
                  gClockWindow, gClockContainer, gClockPill, clock_protection_summary());
 
     pthread_mutex_unlock(&gClockLock);
+
+    /* NOTE: clock_overlay_block_capture() is deliberately NOT called here. It
+       blocks capture device-wide by patching SpringBoard's capture services,
+       which is a much bigger hammer than protecting this app; it stays available
+       for explicit, opt-in use only. The whole-app protection now lives in
+       Swift (funcs/captureprotect.swift). */
     return true;
 }
 

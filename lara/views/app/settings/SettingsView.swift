@@ -55,6 +55,7 @@ struct SettingsView: View {
     
     @AppStorage("logsdisplaymode") private var selectedlogdisplaymode: logsdisplaymode = .toolbar
     @AppStorage("loggerNoBS") private var loggerNoBS: Bool = true
+    @AppStorage("captureShield") private var captureShield: Bool = true
 
     var body: some View {
         NavigationStack {
@@ -180,7 +181,11 @@ struct SettingsView: View {
                     }
                 }
                 
-                Section(header: HeaderLabel(text: "应用", icon: "gearshape"), footer: Text("启用后台保活后，即使应用被最小化，它也会继续运行。")) {
+                Section(header: HeaderLabel(text: "应用", icon: "gearshape"), footer: Text("后台保活让应用被最小化后继续运行；全界面防录屏/防截屏会把整个界面放进安全输入层，截图与录屏中本应用的内容为空白。")) {
+                    Toggle("全界面防录屏 / 防截屏", isOn: $captureShield)
+                        .onChange(of: captureShield) { enabled in
+                            CaptureShield.sync(enabled: enabled)
+                        }
                     Toggle("后台保活", isOn: $keepAlive)
                         .onChange(of: keepAlive) { _ in
                             if keepAlive {

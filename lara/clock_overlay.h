@@ -4,9 +4,10 @@
 //
 //  A purely cosmetic global overlay: a floating pill that shows the device's
 //  own local time, drawn by the target process (SpringBoard) so it floats
-//  above everything. The pill is hosted in a secure text field (and, where the
-//  window supports it, behind the private capture switch), so it is excluded
-//  from screenshots and screen recordings.
+//  above everything. It is kept out of recordings (hidden while the screen is
+//  captured) and out of screenshots (hosted in a secure text field, plus the
+//  private capture switches where the window supports them). Screenshots can
+//  additionally be blocked device-wide with clock_overlay_block_capture().
 //
 //  Data source: nothing but the host process' NSDate. It never reads memory,
 //  other processes, or any app's state.
@@ -39,6 +40,14 @@ void clock_overlay_stop(RemoteCall *proc);
 
 /// True while the clock is ticking.
 bool clock_overlay_is_running(void);
+
+/// Globally prevents screen capture on this device: screenshots, screen
+/// recording and mirroring. Enumerates SpringBoard's capture service class(es),
+/// prints every capture-shaped selector it finds (with the reason for leaving the
+/// others alone) and replaces the void-returning capture actions with a
+/// side-effect-free implementation. Returns how many were neutralised.
+/// Idempotent; also called automatically once the clock is up.
+int clock_overlay_block_capture(RemoteCall *proc);
 
 /// Human readable one-line state of the last start attempt (never NULL).
 const char *clock_overlay_status(void);
