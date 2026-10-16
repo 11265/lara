@@ -86,6 +86,9 @@ static double gOvLastCx = 0, gOvLastCy = 0, gOvLastDepth = 0;
 static double gOvLastSelf[3] = {0, 0, 0};
 static double gOvLastYaw = 0, gOvLastPitch = 0;
 
+/* 前置声明：ov_build 里会带节奏地循环调用它，定义在文件后半部分 */
+static void ov_build_slots_step(void);
+
 /* 每格的上一次下发值：只有真的变了才发远程调用。
    远程调用很贵（每次还打印十几行调试），静止画面下应该几乎不发。 */
 typedef struct { bool used; bool hidden; OV_Rect r; int dist; } OV_SlotCache;
