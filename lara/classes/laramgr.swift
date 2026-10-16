@@ -765,8 +765,10 @@ final class laramgr: ObservableObject {
         let url = fpvEffectiveURL()
         let ratio = UserDefaults.standard.object(forKey: "fpvWidth") as? Double ?? 0.92
         let top = UserDefaults.standard.object(forKey: "fpvTop") as? Double ?? 56.0
+        let hRatio = UserDefaults.standard.object(forKey: "fpvHeight") as? Double ?? 0.0
         url.withCString { clock_overlay_set_url($0) }
         clock_overlay_set_geometry(ratio, top)
+        clock_overlay_set_height_ratio(hRatio)
         pushLayout()                       // 方向 + 全屏 + 分辨率
         logmsg("(fpv) 开始加载第一视角：\(url)（宽 \(Int(ratio * 100))%，\(lastLandscape ? "横屏" : "竖屏")\(UserDefaults.standard.bool(forKey: "fpvFullscreen") ? " 全屏" : "")）")
         clockstarting = true

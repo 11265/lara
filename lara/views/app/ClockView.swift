@@ -18,6 +18,7 @@ struct ClockView: View {
     @AppStorage("fpvWidth") private var fpvWidth: Double = 0.92
     @AppStorage("fpvTop") private var fpvTop: Double = 56
     @AppStorage("fpvFullscreen") private var fpvFullscreen: Bool = false
+    @AppStorage("fpvHeight") private var fpvHeight: Double = 0
     @AppStorage("fpvFov") private var fpvFov: Double = 90
     @AppStorage("fpvEye") private var fpvEye: Double = 1.6
     @AppStorage("fpvTau") private var fpvTau: Double = 70
@@ -89,6 +90,15 @@ struct ClockView: View {
             }
 
             Section {
+                Text("悬浮层盖住的地方，触摸会被系统丢弃（跨进程转发拿不到），所以把画面放到拇指区之外最省事。")
+                    .font(.footnote)
+                    .foregroundColor(.secondary)
+                HStack(spacing: 8) {
+                    presetButton("顶部条", full: false, w: 1.0, top: 0, h: 0.22)
+                    presetButton("上半屏", full: false, w: 1.0, top: 0, h: 0.45)
+                    presetButton("面板", full: false, w: 0.92, top: 56, h: 0)
+                    presetButton("全屏", full: true, w: 1.0, top: 0, h: 0)
+                }
                 Toggle(isOn: Binding(
                     get: { fpvFullscreen },
                     set: { on in
@@ -119,14 +129,25 @@ struct ClockView: View {
                         .font(.system(.caption, design: .monospaced))
                         .frame(width: 46, alignment: .trailing)
                 }
+                HStack {
+                    Text("高度")
+                    Slider(value: Binding(
+                        get: { fpvHeight },
+                        set: { fpvHeight = $0; mgr.pushLayout() }
+                    ), in: 0...0.9, step: 0.05)
+                    Text(fpvHeight == 0 ? "16:9" : "\(Int(fpvHeight * 100))% 屏高")
+                        .font(.system(.caption, design: .monospaced))
+                        .frame(width: 66, alignment: .trailing)
+                }
+                .disabled(fpvFullscreen)
                 Button("重新自检并显示") {
                     mgr.diagnoseClock()
                 }
                 .disabled(!mgr.rcready)
             } header: {
-                Text("尺寸 · 方向")
+                Text("位置 · 尺寸 · 方向")
             } footer: {
-                Text("尺寸按本机真实分辨率算：面板模式高宽比 16:9，全屏模式铺满整屏（顶部距离仍生效）。横屏时浮层自动按设备方向旋转铺开——把手机横过来即可，页面不会重新加载。")
+                Text("尺寸按本机真实分辨率算，横屏时自动按目标窗口方向铺开（不重新加载页面）。想完全不挡操作就用「顶部条」或「上半屏」，下半屏留给游戏。")
             }
 
             Section {
@@ -184,6 +205,20 @@ struct ClockView: View {
             }
         }
         .navigationTitle("第一视角")
+    }
+
+    /// 位置预设：一次把 全屏/宽度/顶部距离/高度 都设好并立刻重排。
+    @ViewBuilder
+    private func presetButton(_ title: String, full: Bool, w: Double, top: Double, h: Double) -> some View {
+        Button(title) {
+            fpvFullscreen = full
+            fpvWidth = w
+            fpvTop = top
+            fpvHeight = h
+            mgr.pushLayout()
+        }
+        .buttonStyle(.bordered)
+        .font(.caption)
     }
 
     /// 直接访问 <地址>/api/health，确认手机能不能连到那台电脑。

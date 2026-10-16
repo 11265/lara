@@ -75,6 +75,7 @@ static char gOvUrl[OV_URL_MAX] = OV_DEFAULT_URL;
 static char gOvUrlLoaded[OV_URL_MAX] = {0};
 static double gOvWidthRatio = OV_WEB_WIDTH_RATIO;
 static double gOvTop = OV_WEB_TOP;
+static double gOvHeightRatio = 0.0;   /* 0 = 16:9；>0 = 按屏高比例（顶部条/上半屏） */
 static unsigned gOvTick = 0;
 /* 单飞 + 失败闩锁：
    远程调用的参数缓冲区在 lara 进程里是全局共享的，两次远程调用同时在飞
@@ -159,6 +160,13 @@ void clock_overlay_set_geometry(double widthRatio, double topMargin)
     pthread_mutex_unlock(&gOvLock);
 }
 
+void clock_overlay_set_height_ratio(double heightRatio)
+{
+    pthread_mutex_lock(&gOvLock);
+    gOvHeightRatio = (heightRatio >= 0.1 && heightRatio <= 1.0) ? heightRatio : 0.0;
+    pthread_mutex_unlock(&gOvLock);
+}
+
 void clock_overlay_set_layout(int landscape, int fullscreen)
 {
     pthread_mutex_lock(&gOvLock);
@@ -201,10 +209,16 @@ static CGRect ov_content_frame(void)
     double width = W * gOvWidthRatio;
     if (width < 200.0) width = W * OV_WEB_WIDTH_RATIO;
     if (width > W) width = W;
-    double height = width * OV_WEB_ASPECT;
+    double height;
+    if (gOvHeightRatio > 0.0) {
+        /* 指定了高度比例：做"顶部条/上半屏"用，宽高不再受 16:9 限制 */
+        height = H * gOvHeightRatio;
+    } else {
+        height = width * OV_WEB_ASPECT;
+    }
     double maxHeight = H - gOvTop - 20.0;
     if (height > maxHeight) height = maxHeight;
-    if (height < 120.0) height = 120.0;
+    if (height < 60.0) height = 60.0;
     return CGRectMake((W - width) / 2.0, gOvTop, width, height);
 }
 

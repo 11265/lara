@@ -30,6 +30,10 @@ void clock_overlay_set_url(const char *url);
 /// topMargin 为距屏幕顶部点数（<=0 用默认值）。高度按 16:9 计算。
 void clock_overlay_set_geometry(double widthRatio, double topMargin);
 
+/// 面板高度占屏比：0（默认）= 按 16:9 算；0.1~1.0 = 直接按屏高比例（配合
+/// widthRatio=1.0 就能做成"顶部条/上半屏"，把下半屏留给游戏操作）。
+void clock_overlay_set_height_ratio(double heightRatio);
+
 /// 屏幕方向与全屏：
 ///   landscape  = 1 表示设备当前是横屏（浮层按设备长短边对调后铺开）；
 ///   fullscreen = 1 表示页面铺满整屏（否则按 widthRatio 的 16:9 面板）。
