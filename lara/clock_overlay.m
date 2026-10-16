@@ -561,8 +561,10 @@ static int ov_draw_snapshot(void)
         double ry = ov_dot(d, up) / depth;
         if (fabs(rx) > tanHalfY * aspect * 1.6 || fabs(ry) > tanHalfY * 1.6) continue;
 
-        /* 面板局部坐标 → 加上面板原点，才是全屏窗口上的坐标 */
-        double cx = px + pw / 2.0 + rx * (pw / 2.0) / tanHalfY;
+        /* 面板局部坐标 → 加上面板原点，才是全屏窗口上的坐标。
+           fov 是竖直视场角（与网页版 three.js 一致），横向像素偏移同样用 ph/2：
+           用 pw/2 会漏掉 aspect，横向被放大 pw/ph 倍（真机上就是"方向/位置都不对"）。 */
+        double cx = px + pw / 2.0 + rx * (ph / 2.0) / tanHalfY;
         double cy = py + ph / 2.0 - ry * (ph / 2.0) / tanHalfY;
 
         double boxH = OV_PERSON_HEIGHT / depth * (ph / 2.0) / tanHalfY;
