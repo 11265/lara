@@ -86,7 +86,8 @@ static bool gOvBuilding = false;
 static bool gOvFailed = false;
 static unsigned gOvGuard = 0;      /* 触摸穿透自愈计数（每 120 个 tick = 30 秒一次） */
 static unsigned gOvWebWait = 0;    /* 网页加载等待计数（24 个 tick = 6 秒） */
-static unsigned gOvOrientTick = 0;  /* 方向轮询计数（4 个 tick = 1 秒） */
+static unsigned gOvOrientTick = 0;  /* 方向轮询计数（已改手选，仅保留占位） */
+static unsigned gOvTreeWalked = 0;  /* 网页子树交互关闭的补做计数（2 秒后补一次） */
 
 /* 前置声明：这两个在 ov_apply_layout / ov_tick 里用到，定义在文件后半部分 */
 static void ov_poll_orientation(void);
@@ -135,6 +136,46 @@ static void ov_status(const char *fmt, ...)
     va_end(ap);
     printf("(overlay) %s\n", gOvStatus);
     fflush(stdout);
+}
+
+/* 整数参数（NSUInteger 等）走 raw 形态，返回 x0。 */
+static uint64_t ov_msg_int(uint64_t obj, const char *sel, long long value)
+{
+    if (!r_is_objc_ptr(obj)) return 0;
+    long long v = value;
+    return r_msg2_main_raw(obj, sel, &v, sizeof(v), NULL, 0, NULL, 0, NULL, 0);
+}
+
+/* 递归把一棵视图子树里的交互全关掉、手势识别器全禁用，返回处理数量。
+   参考实现（peace_esp，真机可用）画的是原生 UIView，全屏覆盖也不影响游戏操作；
+   我们唯一的差别是用 WKWebView —— 它内部会建 WKContentView / WKScrollView 并挂
+   一堆手势识别器，只关父视图的 userInteractionEnabled 未必能让整棵子树安静下来
+   （真机现象：覆盖区域把触摸吃掉）。所以这里逐个视图、逐个手势关下去。 */
+static int ov_disable_interaction_tree(uint64_t view, int depth)
+{
+    if (!r_is_objc_ptr(view) || depth > 4) return 0;
+    int n = 0;
+    ov_set_bool(view, "setUserInteractionEnabled:", 0);
+    n++;
+
+    uint64_t grs = r_msg2_main(view, "gestureRecognizers", 0, 0, 0, 0);
+    if (r_is_objc_ptr(grs)) {
+        uint64_t cnt = r_msg2_main(grs, "count", 0, 0, 0, 0) & 0xffff;
+        for (uint64_t i = 0; i < cnt && i < 16; i++) {
+            uint64_t gr = ov_msg_int(grs, "objectAtIndex:", (long long)i);
+            if (r_is_objc_ptr(gr)) { ov_set_bool(gr, "setEnabled:", 0); n++; }
+        }
+    }
+
+    uint64_t subs = r_msg2_main(view, "subviews", 0, 0, 0, 0);
+    if (r_is_objc_ptr(subs)) {
+        uint64_t cnt = r_msg2_main(subs, "count", 0, 0, 0, 0) & 0xffff;
+        for (uint64_t i = 0; i < cnt && i < 24; i++) {
+            uint64_t sv = ov_msg_int(subs, "objectAtIndex:", (long long)i);
+            n += ov_disable_interaction_tree(sv, depth + 1);
+        }
+    }
+    return n;
 }
 
 #pragma mark - Config (called from lara's process)
@@ -521,6 +562,14 @@ static void ov_tick(void)
         }
     }
 
+    /* WKWebView 的内部视图（WKContentView / WKScrollView）是异步建出来的：
+       建好后 2 秒再整棵子树关一遍交互与手势，这是"覆盖区域吃触摸"的关键修复。 */
+    if (gOvWebMode && r_is_objc_ptr(gOvWeb) && gOvTreeWalked < 8 && ++gOvTreeWalked == 8) {
+        int nd = ov_disable_interaction_tree(gOvWeb, 0);
+        printf("(overlay) 补一次网页子树交互关闭：%d 个视图/手势\n", nd);
+        fflush(stdout);
+    }
+
     /* 网页加载失败兜底：全透明之后，一个加载不出来的 WKWebView 就是“什么都看不见”，
        用户只会觉得没生效。所以发现长时间没加载完就把原生提示条显示出来（带地址与原因）。 */
     if (gOvWebMode && r_is_objc_ptr(gOvWeb)) {
@@ -729,6 +778,13 @@ static bool ov_build(RemoteCall *proc)
     ov_set_bool(window, "setHidden:", 0);
     ov_set_bool(content, "setHidden:", 0);
     if (r_is_objc_ptr(gOvWeb)) ov_set_bool(gOvWeb, "setHidden:", 0);
+    /* 关键：WKWebView 的子树是它自己建的，且可能稍后才建好 ——
+       这里立刻关一遍，tick 里 2 秒后再补一遍（见 gOvTreeWalked）。 */
+    if (r_is_objc_ptr(gOvWeb)) {
+        int nd = ov_disable_interaction_tree(gOvWeb, 0);
+        printf("(overlay) 已关闭网页子树交互：%d 个视图/手势\n", nd);
+        fflush(stdout);
+    }
     /* 别让浮层窗口成为 key window：key 窗口在系统层面更容易拿到输入焦点。
        （触摸穿透仍以 userInteractionEnabled=0 为主，这里是第二道保险。） */
     if (r_responds(window, "resignKeyWindow")) {
