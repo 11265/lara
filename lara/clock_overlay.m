@@ -87,6 +87,10 @@ static unsigned gOvGuard = 0;      /* 触摸穿透自愈计数（每 120 个 tic
 static unsigned gOvWebWait = 0;    /* 网页加载等待计数（24 个 tick = 6 秒） */
 static unsigned gOvOrientTick = 0;  /* 方向轮询计数（4 个 tick = 1 秒） */
 
+/* 前置声明：这两个在 ov_apply_layout / ov_tick 里用到，定义在文件后半部分 */
+static void ov_poll_orientation(void);
+static int ov_target_interface_orientation(void);
+
 /* 方向 / 全屏：由 lara 主线程用设备方向推过来（见 clock_overlay_set_layout）。
    目标进程的窗口空间跟随设备方向，所以横屏 = 长短边对调；尺寸全部按本机真实
    分辨率算，方向变化时只重设 frame，不重建浮层、不重新加载页面。 */
