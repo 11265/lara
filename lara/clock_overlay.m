@@ -83,6 +83,7 @@ static unsigned gOvTick = 0;
    SpringBoard 崩溃。所以：同一时刻只允许一次构建；一旦失败，绝不再自动重试。 */
 static bool gOvBuilding = false;
 static bool gOvFailed = false;
+static unsigned gOvGuard = 0;      /* 触摸穿透自愈计数（每 8 个 tick = 2 秒一次） */
 
 /* 方向 / 全屏：由 lara 主线程用设备方向推过来（见 clock_overlay_set_layout）。
    目标进程的窗口空间跟随设备方向，所以横屏 = 长短边对调；尺寸全部按本机真实
@@ -421,6 +422,26 @@ static void ov_tick(void)
     if (gOvAppliedLandscape != gOvLandscape || gOvAppliedFullscreen != gOvFullscreen
         || gOvAppliedW != W || gOvAppliedH != H) {
         ov_apply_layout();
+    }
+
+    /* 触摸穿透自愈：iOS 有时会重建窗口内部视图、把交互重新打开，
+       而一个 999999 层级、全屏的窗口一旦变回“可交互”，就会把游戏的手指全吃掉
+       （真机现象：桌面和 lara 能点、别的游戏点不动）。这里每 2 秒重新关一次，
+       并把回读值打进日志，让穿透状态可验证。 */
+    if (++gOvGuard >= 8) {
+        gOvGuard = 0;
+        ov_set_bool(gOvWindow, "setUserInteractionEnabled:", 0);
+        if (r_is_objc_ptr(gOvWeb)) {
+            ov_set_bool(gOvWeb, "setUserInteractionEnabled:", 0);
+            uint64_t scroll = r_msg2_main(gOvWeb, "scrollView", 0, 0, 0, 0);
+            if (r_is_objc_ptr(scroll)) ov_set_bool(scroll, "setUserInteractionEnabled:", 0);
+        }
+        uint64_t winUI = r_msg2_main(gOvWindow, "isUserInteractionEnabled", 0, 0, 0, 0);
+        if ((winUI & 0xff) != 0) {
+            printf("(overlay) 警告：窗口又变成可交互（winUI=%u），已再次关闭\n",
+                   (unsigned)(winUI & 0xff));
+            fflush(stdout);
+        }
     }
     pthread_mutex_unlock(&gOvLock);
 }
