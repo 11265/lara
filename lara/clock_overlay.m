@@ -80,6 +80,11 @@ static uint64_t gOvFont = 0, gOvWhiteColor = 0, gOvRedCGColor = 0, gOvClearColor
 static uint64_t gOvClsView = 0, gOvClsLabel = 0;
 static unsigned long gOvCallCount = 0;
 
+/* 诊断样本：最近一次投影结果（只用于 5 秒一次的日志，方便定位"位置不对"） */
+static double gOvLastCx = 0, gOvLastCy = 0, gOvLastDepth = 0;
+static double gOvLastSelf[3] = {0, 0, 0};
+static double gOvLastYaw = 0, gOvLastPitch = 0;
+
 /* 每格的上一次下发值：只有真的变了才发远程调用。
    远程调用很贵（每次还打印十几行调试），静止画面下应该几乎不发。 */
 typedef struct { bool used; bool hidden; OV_Rect r; int dist; } OV_SlotCache;
@@ -456,7 +461,7 @@ static void ov_build_slots_step(void)
         gOvCrossDone = true;
         double px = 0, py = 0, pw = 0, ph = 0;
         ov_panel_rect(&px, &py, &pw, &ph);
-        double cx = pw / 2.0, cy = ph / 2.0;
+        double cx = px + pw / 2.0, cy = py + ph / 2.0;      /* 面板原点不能漏 */
         OV_Rect h = {cx - 9.0, cy - 0.75, 18.0, 1.5};
         OV_Rect v = {cx - 0.75, cy - 9.0, 1.5, 18.0};
         gOvCrossH = ov_make_view(gOvClsView, gOvWhiteColor, 0.0, 0, h, false);
@@ -472,7 +477,13 @@ static void ov_build_slots_step(void)
 #pragma mark - 每帧绘制
 
 /* 解析一行快照并更新方框。返回画出来的方框数。
-   带脏检查：frame/隐藏状态/距离数字与上次相同就完全不发远程调用。 */
+   带脏检查：frame/隐藏状态/距离数字与上次相同就完全不发远程调用。
+
+   坐标约定（重要）：
+     · 方框加在**全屏窗口**上，所以投影算出来的面板局部坐标必须加上面板原点 (px,py)，
+       否则整幅画面会偏移一个面板位置（真机上就是"位置不对"）。
+     · UE 传来的 z 是胶囊中心（脚底上方约 0.9m），所以相机取 self_z + (眼高 - 0.9)，
+       人物直接用自身 z，不再额外加身高。 */
 static int ov_draw_snapshot(void)
 {
     if (!r_is_objc_ptr(gOvWindow) || !gOvSnapFresh || !gOvSnap[0]) {
@@ -496,8 +507,11 @@ static int ov_draw_snapshot(void)
     char *p = gOvSnap;
     double sx = 0, sy = 0, sz = 0, yaw = 0, pitch = 0;
     if (sscanf(p, "%lf,%lf,%lf,%lf,%lf", &sx, &sy, &sz, &yaw, &pitch) != 5) return 0;
+    gOvLastSelf[0] = sx; gOvLastSelf[1] = sy; gOvLastSelf[2] = sz;
+    gOvLastYaw = yaw; gOvLastPitch = pitch;
     OV_Vec3 cam = ov_ue_to_world(sx, sy, sz);
-    cam.z += gOvEye;
+    /* 眼高是"脚底往上"的量，而 z 是胶囊中心（脚底上方 0.9m），所以减去 0.9 */
+    cam.z += (gOvEye - 0.9);
 
     double yr = -yaw * M_PI / 180.0;
     double pr = pitch * M_PI / 180.0;
@@ -524,8 +538,7 @@ static int ov_draw_snapshot(void)
         double ex = 0, ey = 0, ez = 0;
         int kind = 0;
         if (sscanf(tok, "%lf,%lf,%lf,%d", &ex, &ey, &ez, &kind) != 4) continue;
-        OV_Vec3 w = ov_ue_to_world(ex, ey, ez);
-        w.z += OV_PERSON_HEIGHT * 0.5;
+        OV_Vec3 w = ov_ue_to_world(ex, ey, ez);       /* z 本身就是胶囊中心，不要再加身高 */
 
         OV_Vec3 d = ov_sub(w, cam);
         double depth = ov_dot(d, fwd);
@@ -534,12 +547,14 @@ static int ov_draw_snapshot(void)
         double ry = ov_dot(d, up) / depth;
         if (fabs(rx) > tanHalfY * aspect * 1.6 || fabs(ry) > tanHalfY * 1.6) continue;
 
-        double cx = pw / 2.0 + rx * (pw / 2.0) / tanHalfY;
-        double cy = ph / 2.0 - ry * (ph / 2.0) / tanHalfY;
+        /* 面板局部坐标 → 加上面板原点，才是全屏窗口上的坐标 */
+        double cx = px + pw / 2.0 + rx * (pw / 2.0) / tanHalfY;
+        double cy = py + ph / 2.0 - ry * (ph / 2.0) / tanHalfY;
 
         double boxH = OV_PERSON_HEIGHT / depth * (ph / 2.0) / tanHalfY;
         if (boxH < OV_MIN_BOX_PX) boxH = OV_MIN_BOX_PX;
         double boxW = boxH * 0.52;
+        if (drawn == 0) { gOvLastCx = cx; gOvLastCy = cy; gOvLastDepth = depth; }
 
         int i = drawn++;
         used[i] = true;
@@ -600,8 +615,13 @@ static void ov_tick(void)
 
     static unsigned tick = 0;
     if (++tick % (OV_TICK_HZ * 5) == 0) {          /* 每 5 秒一行摘要 */
-        printf("(overlay) 绘制中：方框 %d 个，快照%s，状态：%s\n",
-               drawn, gOvSnapFresh ? "有" : "无", gOvStatus);
+        double px = 0, py = 0, pw = 0, ph = 0;
+        ov_panel_rect(&px, &py, &pw, &ph);
+        printf("(overlay) 绘制中：方框 %d 个，快照%s，面板=%.0f,%.0f %.0fx%.0f，"
+               "样本 depth=%.1fm → 屏(%.0f,%.0f) 自己UE=(%.0f,%.0f,%.0f) 朝向=%.0f°/%.0f°\n",
+               drawn, gOvSnapFresh ? "有" : "无", px, py, pw, ph,
+               gOvLastDepth, gOvLastCx, gOvLastCy,
+               gOvLastSelf[0], gOvLastSelf[1], gOvLastSelf[2], gOvLastYaw, gOvLastPitch);
         fflush(stdout);
     }
     pthread_mutex_unlock(&gOvLock);
