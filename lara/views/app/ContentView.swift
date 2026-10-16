@@ -57,7 +57,7 @@ struct ContentView: View {
     private var AlertsSection: some View {
         Section {
             if !mgr.hasOffsets {
-                PlainAlert(title: "未找到偏移量！", icon: "exclamationmark.triangle.fill", text: "缺少内核缓存偏移量。请点击\"运行漏洞利用\"然后获取偏移量。")
+                PlainAlert(title: "未找到偏移量！", icon: "exclamationmark.triangle.fill", text: "缺少内核缓存偏移量。请点击\"初始化\"然后获取偏移量。")
             }
         }
     }
@@ -76,11 +76,15 @@ struct ContentView: View {
                     Image(systemName: "xmark.circle")
                 }
             }) {
-                Button("运行漏洞利用", action: {
+                Button("初始化", action: {
                     offsets_init()
-                    mgr.run()
+                    if mgr.hasOffsets {
+                        mgr.run()          // 漏洞利用成功后会自动接着做系统初始化
+                    } else {
+                        mgr.run()
+                    }
                 })
-                .disabled(mgr.dsready || mgr.dsrunning || isdebugged())
+                .disabled(mgr.dsrunning || (mgr.dsready && mgr.vfsready && mgr.sbxready) || isdebugged())
             }
 
             if !mgr.hasOffsets {
@@ -128,11 +132,8 @@ struct ContentView: View {
                             Image(systemName: "xmark.circle")
                         }
                     }) {
-                        Button("初始化系统", action: {
-                            mgr.vfsinit()
-                            mgr.sbxescape()
-                        })
-                        .disabled(!mgr.hasOffsets || !mgr.dsready || mgr.vfsrunning || mgr.sbxrunning || (mgr.vfsready && mgr.sbxready))
+                        Text("系统初始化（VFS + 沙盒逃逸，随「初始化」自动执行）")
+                            .foregroundColor(.secondary)
                     }
                 }
                 if selectedmethod == .vfs {
@@ -188,9 +189,9 @@ struct ContentView: View {
             #if !DISABLE_REMOTECALL
             Section {
                 LabeledContent(content: {
-                    if mgr.rcready {
+                    if mgr.clockrunning {
                         Image(systemName: "checkmark.circle")
-                    } else if mgr.rcrunning {
+                    } else if mgr.rcrunning || mgr.clockstarting {
                         HStack {
                             Text("运行中...")
                             ProgressView()
@@ -199,32 +200,13 @@ struct ContentView: View {
                         Image(systemName: "xmark.circle")
                     }
                 }) {
-                    Button("初始化远程调用", action: {
-                        mgr.rcinit(process: "SpringBoard", migbypass: false) { success in
-                            if success {
-                                mgr.logmsg("远程调用初始化成功！")
-                                let pid = mgr.rccall(name: "getpid")
-                                mgr.logmsg("远程 getpid() 返回：\(pid)")
-                                // 调通远程调用后直接显示全局悬浮时间
-                                mgr.startClock()
-                            } else {
-                                mgr.logmsg("远程调用初始化失败")
-                                mgr.rcfailed = true
-                            }
+                    Toggle("开启", isOn: Binding(
+                        get: { mgr.clockrunning || mgr.rcrunning || mgr.clockstarting },
+                        set: { on in
+                            if on { mgr.enableAll() } else { mgr.disableAll() }
                         }
-                    })
-                    .disabled(!mgr.dsready || isdebugged() || mgr.rcrunning || mgr.rcready)
-                }
-
-                if mgr.rcready {
-                    Button("销毁远程调用", action: {
-                        mgr.rcdestroy()
-                    })
-                }
-
-                LabeledContent("全局悬浮 · 第一视角") {
-                    Text(mgr.clockrunning ? "已显示" : "未显示")
-                        .foregroundColor(mgr.clockrunning ? .green : .secondary)
+                    ))
+                    .disabled(!mgr.dsready && !mgr.clockrunning)
                 }
 
                 if !mgr.clockstatus.isEmpty {
@@ -234,7 +216,7 @@ struct ContentView: View {
                         .textSelection(.enabled)
                 }
             } header: {
-                HeaderLabel(text: "远程调用", icon: "syringe")
+                HeaderLabel(text: "开启（远程调用 + 第一视角）", icon: "syringe")
             } footer: {
                 VStack(alignment: .leading, spacing: 4) {
                     if let error = mgr.rcLastError ?? mgr.sbProc?.lastError {
@@ -249,7 +231,7 @@ struct ContentView: View {
                     }
                     Text("远程调用相对不稳定，可能无法正常工作。")
                     if isIOS16() {
-                        Text("iOS 16 提示：点击\"初始化远程调用\"后打开控制中心。这可以显著提高成功率和速度。")
+                        Text("iOS 16 提示：打开\"开启\"后立刻下拉控制中心。这可以显著提高成功率和速度。")
                             .fontWeight(.semibold)
                             .foregroundColor(.orange)
                         Text("如果初始化在大约 2 分钟后失败，请执行 Respring，重新启动 Lara，然后重试。")

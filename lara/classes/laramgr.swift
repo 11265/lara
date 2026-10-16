@@ -138,6 +138,9 @@ final class laramgr: ObservableObject {
                     self.logmsg(String(format: "(ds) kernel_slide: 0x%llx\n", self.kernslide))
                     globallogger.log("(ds) exploit success!")
                     globallogger.log(String(format: "(ds) kernel_base: 0x%llx", self.kernbase))
+                    /* 「初始化」把他俩合成一步：漏洞利用成功后接着做系统初始化
+                       （VFS + 沙盒逃逸），用户不用再点第二次。 */
+                    self.initSystemIfNeeded()
                     globallogger.log(String(format: "(ds) kernel_slide: 0x%llx", self.kernslide))
                     globallogger.divider()
                 } else {
@@ -850,6 +853,56 @@ final class laramgr: ObservableObject {
                 self?.logmsg("(fpv) \(status)")
             }
         }
+    }
+
+    // ── 一步到位：初始化 / 开启 ────────────────────────────────────────────
+
+    private var systemInitStarted = false
+
+    /// 「初始化」的第二步：漏洞利用成功后自动做系统初始化（VFS + 沙盒逃逸）。
+    func initSystemIfNeeded() {
+        guard dsready, !systemInitStarted else { return }
+        systemInitStarted = true
+        logmsg("(init) 漏洞利用完成，继续系统初始化…")
+        vfsinit { [weak self] _ in
+            self?.sbxescape { _ in
+                self?.logmsg("(init) 系统初始化结束")
+                self?.systemInitStarted = false
+            }
+        }
+    }
+
+    /// 「开启」：初始化远程调用 + 启动第一视角浮层，一步到位。
+    func enableAll() {
+        if clockrunning { return }
+        if rcready {
+            startClock()
+            return
+        }
+        guard !rcrunning else { return }
+        guard dsready else {
+            clockstatus = "请先初始化"
+            return
+        }
+        logmsg("(开启) 初始化远程调用…")
+        rcinit(process: "SpringBoard", migbypass: false) { [weak self] success in
+            guard let self else { return }
+            if success {
+                self.logmsg("远程调用初始化成功！")
+                let pid = self.rccall(name: "getpid")
+                self.logmsg("远程 getpid() 返回：\(pid)")
+                self.startClock()
+            } else {
+                self.logmsg("远程调用初始化失败")
+                self.rcfailed = true
+            }
+        }
+    }
+
+    /// 「关闭」：停浮层 + 销毁远程调用。
+    func disableAll() {
+        stopClock()
+        if rcready { rcdestroy() }
     }
 
     /// 强制重建悬浮窗并逐步骤写日志（第一视角页的「重新自检并显示」按钮）。
