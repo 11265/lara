@@ -82,6 +82,7 @@ final class laramgr: ObservableObject {
     @Published var showLogs: Bool = false
     @Published var clockrunning: Bool = false
     @Published var clockstatus: String = ""
+    @Published var clockstarting: Bool = false      // 正在建浮层：防止并发远程调用
 
     var sbProc: RemoteCall?
     var ytProc = RemoteCall(process: "youtube", useMigFilterBypass: false)
@@ -697,24 +698,32 @@ final class laramgr: ObservableObject {
     static let fpvDefaultURL = "http://192.168.137.1:18099/"
 
     func startClock() {
-        guard dsready, let sbProc, !clockrunning else { return }
+        guard dsready, let sbProc, !clockrunning, !clockstarting else { return }
+        // 上次把远程会话弄坏后就上锁：不再自动重试，避免反复冲击参数缓冲区把 SpringBoard 打崩
+        if clock_overlay_failed() {
+            clockstatus = String(cString: clock_overlay_status())
+            logmsg("(fpv) 已上锁，不再自动重试：请在第一视角页按「重新自检并显示」")
+            return
+        }
         // 悬浮层由 lara 进程驱动，lara 被挂起就会停：自动打开后台保活
         if !kaenabled {
             toggleka()
             UserDefaults.standard.set(true, forKey: "keepAlive")
             logmsg("(fpv) 已自动开启后台保活")
         }
-        // 页面地址与尺寸来自设置（悬浮时钟页）
+        // 页面地址与尺寸来自设置（第一视角页）
         let url = UserDefaults.standard.string(forKey: "fpvURL") ?? Self.fpvDefaultURL
         let ratio = UserDefaults.standard.object(forKey: "fpvWidth") as? Double ?? 0.92
         let top = UserDefaults.standard.object(forKey: "fpvTop") as? Double ?? 56.0
         url.withCString { clock_overlay_set_url($0) }
         clock_overlay_set_geometry(ratio, top)
         logmsg("(fpv) 开始加载第一视角：\(url)（宽 \(Int(ratio * 100))%）")
+        clockstarting = true
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let ok = clock_overlay_start(sbProc)
             let status = String(cString: clock_overlay_status())
             DispatchQueue.main.async {
+                self?.clockstarting = false
                 self?.clockrunning = ok
                 self?.clockstatus = status
                 self?.logmsg(ok ? "(fpv) \(status)" : "(fpv) 失败：\(status)")
@@ -740,21 +749,25 @@ final class laramgr: ObservableObject {
         }
     }
 
-    /// 强制重建悬浮窗并逐步骤写日志（Tools/时钟页的「自检」按钮）。
+    /// 强制重建悬浮窗并逐步骤写日志（第一视角页的「重新自检并显示」按钮）。
+    /// 这是唯一会解开「失败闩锁」的入口：会话被弄坏后必须由用户显式重试。
     func diagnoseClock() {
         guard dsready, let sbProc else {
             clockstatus = "远程调用未就绪"
             return
         }
+        guard !clockstarting else { return }
         clockstatus = "自检运行中…"
-        logmsg("(clock) 自检开始…")
+        clockstarting = true
+        logmsg("(fpv) 自检开始…")
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let ok = clock_overlay_selftest(sbProc)
             let status = String(cString: clock_overlay_status())
             DispatchQueue.main.async {
+                self?.clockstarting = false
                 self?.clockrunning = ok && clock_overlay_is_running()
                 self?.clockstatus = status
-                self?.logmsg("(clock) 自检\(ok ? "成功" : "失败")：\(status)")
+                self?.logmsg("(fpv) 自检\(ok ? "成功" : "失败")：\(status)")
             }
         }
     }

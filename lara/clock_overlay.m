@@ -35,6 +35,7 @@
 #import <stdarg.h>
 #import <stdio.h>
 #import <string.h>
+#import <unistd.h>
 
 #pragma mark - Tunables
 
@@ -75,6 +76,13 @@ static char gOvUrlLoaded[OV_URL_MAX] = {0};
 static double gOvWidthRatio = OV_WEB_WIDTH_RATIO;
 static double gOvTop = OV_WEB_TOP;
 static unsigned gOvTick = 0;
+/* 单飞 + 失败闩锁：
+   远程调用的参数缓冲区在 lara 进程里是全局共享的，两次远程调用同时在飞
+   （真机日志里出现过：malloc/getpid 的回复交错）会让 malloc 返回垃圾指针，
+   接着 remote_write 写到地址 0，目标进程就带着脏寄存器执行 objc_getClass →
+   SpringBoard 崩溃。所以：同一时刻只允许一次构建；一旦失败，绝不再自动重试。 */
+static bool gOvBuilding = false;
+static bool gOvFailed = false;
 
 static void ov_status(const char *fmt, ...)
 {
@@ -319,6 +327,52 @@ static void ov_start_timer(RemoteCall *proc)
     (void)proc;
 }
 
+#pragma mark - 会话健康检查
+
+/* 远程会话自检：在碰任何 objc 类之前，先确认“远程调用 + 远程内存读写”是好的。
+   做法都是 crash-safe 的：
+     1) getpid 必须等于目标 pid；
+     2) 远程 malloc 一小块，写魔数再读回，必须一致。
+   任何一步不对就直接放弃建浮层——目标进程活着，用户重开一次就好；
+   反之一旦带着坏参数去调 objc_getClass，SpringBoard 必崩。 */
+static bool ov_session_healthy(RemoteCall *proc, const char **why)
+{
+    for (int attempt = 0; attempt < 3; attempt++) {
+        /* 让上一次调用彻底回收，避免和残留的调用交错 */
+        r_settle_us(30000);
+        usleep(80 * 1000);
+
+        uint64_t pid = r_dlsym_call(R_TIMEOUT, "getpid", 0, 0, 0, 0, 0, 0, 0, 0);
+        if (pid != (uint64_t)proc.pid) {
+            *why = "getpid 与目标 pid 不一致（远程调用回复可能已错位）";
+            printf("(overlay) 健康检查[%d]：getpid=0x%llx 期望 %d\n", attempt, pid, proc.pid);
+            fflush(stdout);
+            continue;
+        }
+
+        uint64_t scratch = r_dlsym_call(R_TIMEOUT, "malloc", 64, 0, 0, 0, 0, 0, 0, 0);
+        if (!r_is_objc_ptr(scratch) || scratch < 0x10000ULL) {
+            *why = "远程 malloc 返回的不是有效指针（远程 vm 读写已失效）";
+            printf("(overlay) 健康检查[%d]：malloc=0x%llx\n", attempt, scratch);
+            fflush(stdout);
+            continue;
+        }
+
+        const uint64_t magic = 0x1122334455667788ULL;
+        bool wrote = [proc remote_write64:scratch value:magic];
+        uint64_t back = wrote ? [proc remoteRead64From:scratch] : 0;
+        r_dlsym_call(R_TIMEOUT, "free", scratch, 0, 0, 0, 0, 0, 0, 0);
+        if (!wrote || back != magic) {
+            *why = "远程内存写入/读回不一致";
+            printf("(overlay) 健康检查[%d]：write=%d read=0x%llx\n", attempt, wrote, back);
+            fflush(stdout);
+            continue;
+        }
+        return true;
+    }
+    return false;
+}
+
 #pragma mark - Build
 
 /* Numbered steps, printed as we go: the last line in lara.log is the last call
@@ -330,6 +384,9 @@ static bool ov_build(RemoteCall *proc)
     /* Point remote_objc's global helpers at lara's live SpringBoard session. */
     arc_use_existing_remote_call((__bridge void *)proc);
     r_settle_us(1500);
+    /* 参数缓冲区是全局共享的：开工前留一点时间让上一次调用彻底收尾，
+       否则两次远程调用同时在飞会让 malloc 返回垃圾指针 → 目标进程崩溃。 */
+    usleep(120 * 1000);
 
     /* 1/6 — classes. */
     uint64_t clsApplication = r_class("UIApplication");
@@ -429,6 +486,31 @@ bool clock_overlay_start(RemoteCall *proc)
         pthread_mutex_unlock(&gOvLock);
         return true;
     }
+    /* 上一次已经把远程会话弄坏了：绝不再自动重试（要重试请按「自检」）。 */
+    if (gOvFailed) {
+        pthread_mutex_unlock(&gOvLock);
+        return false;
+    }
+    /* 单飞：同一时刻只允许一次构建，避免两次远程调用同时在飞。 */
+    if (gOvBuilding) {
+        pthread_mutex_unlock(&gOvLock);
+        return false;
+    }
+    gOvBuilding = true;
+    pthread_mutex_unlock(&gOvLock);
+
+    /* 动 objc 之前先探一探会话是否健康（不健康就什么都不做，目标进程活着）。 */
+    const char *why = "未知原因";
+    if (!ov_session_healthy(proc, &why)) {
+        pthread_mutex_lock(&gOvLock);
+        gOvBuilding = false;
+        gOvFailed = true;
+        pthread_mutex_unlock(&gOvLock);
+        ov_status("已放弃：远程会话不健康（%s）。目标进程未受影响；修好后按「自检」重试。", why);
+        return false;
+    }
+
+    pthread_mutex_lock(&gOvLock);
 
     /* Still alive in the same target? Just show it again. */
     uint64_t existing = r_is_objc_ptr(gOvWeb) ? gOvWeb : gOvPill;
@@ -443,6 +525,7 @@ bool clock_overlay_start(RemoteCall *proc)
             ov_start_timer(proc);
             ov_status("复用已有浮层：window=0x%llx content=0x%llx(%s)",
                       gOvWindow, existing, gOvWebMode ? "第一视角" : "时间胶囊");
+            gOvBuilding = false;
             pthread_mutex_unlock(&gOvLock);
             return true;
         }
@@ -455,8 +538,10 @@ bool clock_overlay_start(RemoteCall *proc)
     gOvUrlLoaded[0] = '\0';
 
     bool attached = ov_build(proc);
+    gOvBuilding = false;
     if (!attached) {
-        /* ov_build printed the last step it reached. */
+        /* ov_build printed the last step it reached. 会话很可能已被破坏 → 上锁不再重试 */
+        gOvFailed = true;
         pthread_mutex_unlock(&gOvLock);
         return false;
     }
@@ -471,6 +556,11 @@ bool clock_overlay_start(RemoteCall *proc)
     return true;
 }
 
+bool clock_overlay_failed(void)
+{
+    return gOvFailed;
+}
+
 bool clock_overlay_selftest(RemoteCall *proc)
 {
     if (!proc) {
@@ -481,6 +571,7 @@ bool clock_overlay_selftest(RemoteCall *proc)
     /* Clean slate, so the numbered steps below tell the whole story. */
     pthread_mutex_lock(&gOvLock);
     gOvRunning = false;
+    gOvFailed = false;                 /* 用户显式重试：解开失败闩锁 */
     if (gOvTimer) {
         dispatch_source_cancel(gOvTimer);
         gOvTimer = nil;

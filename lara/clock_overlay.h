@@ -52,6 +52,12 @@ void clock_overlay_stop(RemoteCall *proc);
 /// True while the overlay is up.
 bool clock_overlay_is_running(void);
 
+/// True when a previous start failed *after* it had already touched the remote
+/// session. lara must not auto-retry in that state: the target's remote-call
+/// argument buffer is global state, and hammering it while it is broken is what
+/// took SpringBoard down. Cleared by clock_overlay_selftest().
+bool clock_overlay_failed(void);
+
 /// Human readable one-line state of the last start attempt (never NULL).
 const char *clock_overlay_status(void);
 
