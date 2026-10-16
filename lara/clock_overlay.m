@@ -44,7 +44,7 @@
 #define OV_SNAP_MAX           4096
 #define OV_MAX_SLOTS          48
 #define OV_DEFAULT_SLOTS      24
-#define OV_TICK_HZ            30                      /* 绘制帧率 */
+#define OV_TICK_HZ            20                      /* 绘制帧率 */
 #define OV_TICK_MS            (1000 / OV_TICK_HZ)
 #define OV_DEFAULT_FOV        90.0
 #define OV_DEFAULT_EYE        1.60
@@ -70,6 +70,12 @@ static uint64_t gOvName[OV_MAX_SLOTS];
 static uint64_t gOvDist[OV_MAX_SLOTS];
 static uint64_t gOvCrossH = 0, gOvCrossV = 0;
 static int gOvSlotsAllocated = 0;
+
+/* 每格的上一次下发值：只有真的变了才发远程调用。
+   远程调用很贵（每次还打印十几行调试），静止画面下应该几乎不发。 */
+typedef struct { bool used; bool hidden; OV_Rect r; int dist; } OV_SlotCache;
+static OV_SlotCache gOvCache[OV_MAX_SLOTS];
+static bool gOvCacheValid = false;
 
 static char gOvStatus[OV_STATUS_MAX] = "尚未启动";
 static char gOvUrl[OV_URL_MAX] = "";
@@ -400,19 +406,25 @@ static bool ov_build(RemoteCall *proc)
 
     gOvWindow = win;
     gOvPid = proc.pid;
+    gOvCacheValid = false;          /* 新窗口：第一帧全部重发 */
     return r_is_objc_ptr(found) && found == win;
 }
 
 #pragma mark - 每帧绘制
 
-/* 解析一行快照并更新方框。返回画出来的方框数。 */
+/* 解析一行快照并更新方框。返回画出来的方框数。
+   带脏检查：frame/隐藏状态/距离数字与上次相同就完全不发远程调用。 */
 static int ov_draw_snapshot(void)
 {
     if (!r_is_objc_ptr(gOvWindow) || !gOvSnapFresh || !gOvSnap[0]) {
-        for (int i = 0; i < gOvSlotsAllocated; i++) {
-            if (r_is_objc_ptr(gOvBox[i])) ov_set_bool(gOvBox[i], "setHidden:", 1);
-            if (r_is_objc_ptr(gOvName[i])) ov_set_bool(gOvName[i], "setHidden:", 1);
-            if (r_is_objc_ptr(gOvDist[i])) ov_set_bool(gOvDist[i], "setHidden:", 1);
+        if (gOvCacheValid) {
+            for (int i = 0; i < gOvSlotsAllocated; i++) {
+                if (!gOvCache[i].hidden) {
+                    if (r_is_objc_ptr(gOvBox[i])) ov_set_bool(gOvBox[i], "setHidden:", 1);
+                    if (r_is_objc_ptr(gOvDist[i])) ov_set_bool(gOvDist[i], "setHidden:", 1);
+                    gOvCache[i].hidden = true;
+                }
+            }
         }
         return 0;
     }
@@ -440,10 +452,12 @@ static int ov_draw_snapshot(void)
     double tanHalfY = tan(gOvFov * M_PI / 360.0);
     double aspect = pw / ph;
 
-    /* 跳到第一个 ';' 之后 */
     char *semi = strchr(gOvSnap, ';');
     if (!semi) return 0;
     p = semi + 1;
+
+    static bool used[OV_MAX_SLOTS];
+    memset(used, 0, sizeof(used));
 
     int drawn = 0;
     char *save = NULL;
@@ -452,7 +466,7 @@ static int ov_draw_snapshot(void)
         int kind = 0;
         if (sscanf(tok, "%lf,%lf,%lf,%d", &ex, &ey, &ez, &kind) != 4) continue;
         OV_Vec3 w = ov_ue_to_world(ex, ey, ez);
-        w.z += OV_PERSON_HEIGHT * 0.5;                 /* 用身体中心对准方框中心 */
+        w.z += OV_PERSON_HEIGHT * 0.5;
 
         OV_Vec3 d = ov_sub(w, cam);
         double depth = ov_dot(d, fwd);
@@ -469,25 +483,44 @@ static int ov_draw_snapshot(void)
         double boxW = boxH * 0.52;
 
         int i = drawn++;
+        used[i] = true;
         OV_Rect box = {cx - boxW / 2.0, cy - boxH / 2.0, boxW, boxH};
-        ov_set_rect(gOvBox[i], "setFrame:", box);
-        ov_set_bool(gOvBox[i], "setHidden:", 0);
+        int distM = (int)(depth + 0.5);
 
-        char buf[OV_NAME_TEXT_MAX];
-        snprintf(buf, sizeof(buf), "%dm", (int)(depth + 0.5));
-        if (r_is_objc_ptr(gOvDist[i])) {
-            ov_set_text(gOvDist[i], buf);
-            OV_Rect dl = {cx - 40.0, cy + boxH / 2.0 + 2.0, 80.0, 14.0};
-            ov_set_rect(gOvDist[i], "setFrame:", dl);
-            ov_set_bool(gOvDist[i], "setHidden:", gOvShowDist ? 0 : 1);
+        OV_SlotCache *c = &gOvCache[i];
+        bool need = !gOvCacheValid || c->hidden || !c->used
+                    || fabs(c->r.x - box.x) > 0.5 || fabs(c->r.y - box.y) > 0.5
+                    || fabs(c->r.w - box.w) > 0.5 || fabs(c->r.h - box.h) > 0.5
+                    || c->dist != distM;
+        if (need) {
+            if (!gOvCacheValid || c->hidden || !c->used || fabs(c->r.x - box.x) > 0.5
+                || fabs(c->r.y - box.y) > 0.5 || fabs(c->r.w - box.w) > 0.5
+                || fabs(c->r.h - box.h) > 0.5) {
+                ov_set_rect(gOvBox[i], "setFrame:", box);
+                ov_set_bool(gOvBox[i], "setHidden:", 0);
+                if (r_is_objc_ptr(gOvDist[i])) {
+                    OV_Rect dl = {cx - 40.0, cy + boxH / 2.0 + 2.0, 80.0, 14.0};
+                    ov_set_rect(gOvDist[i], "setFrame:", dl);
+                    ov_set_bool(gOvDist[i], "setHidden:", gOvShowDist ? 0 : 1);
+                }
+            }
+            if (!gOvCacheValid || c->dist != distM) {
+                char buf[OV_NAME_TEXT_MAX];
+                snprintf(buf, sizeof(buf), "%dm", distM);
+                ov_set_text(gOvDist[i], buf);
+            }
+            c->used = true; c->hidden = false; c->r = box; c->dist = distM;
         }
     }
 
     for (int i = drawn; i < gOvSlotsAllocated; i++) {
+        OV_SlotCache *c = &gOvCache[i];
+        if (gOvCacheValid && (c->hidden || !c->used)) continue;
         if (r_is_objc_ptr(gOvBox[i])) ov_set_bool(gOvBox[i], "setHidden:", 1);
-        if (r_is_objc_ptr(gOvName[i])) ov_set_bool(gOvName[i], "setHidden:", 1);
         if (r_is_objc_ptr(gOvDist[i])) ov_set_bool(gOvDist[i], "setHidden:", 1);
+        c->hidden = true; c->used = false;
     }
+    gOvCacheValid = true;
     return drawn;
 }
 
@@ -535,6 +568,7 @@ void clock_overlay_set_view(int maxSlots, double fovDeg, double eyeHeight,
     gOvShowNames = showNames ? 1 : 0;
     gOvShowDist = showDist ? 1 : 0;
     gOvShowCross = showCross ? 1 : 0;
+    gOvCacheValid = false;          /* 画面参数变了：下一帧重发 */
     pthread_mutex_unlock(&gOvLock);
 }
 
@@ -543,6 +577,7 @@ void clock_overlay_set_geometry(double widthRatio, double topMargin)
     pthread_mutex_lock(&gOvLock);
     gOvWidthRatio = (widthRatio >= 0.2 && widthRatio <= 1.0) ? widthRatio : 0.92;
     gOvTop = (topMargin >= 0.0 && topMargin <= 600.0) ? topMargin : 56.0;
+    gOvCacheValid = false;
     pthread_mutex_unlock(&gOvLock);
 }
 
@@ -550,6 +585,7 @@ void clock_overlay_set_height_ratio(double heightRatio)
 {
     pthread_mutex_lock(&gOvLock);
     gOvHeightRatio = (heightRatio >= 0.1 && heightRatio <= 1.0) ? heightRatio : 0.0;
+    gOvCacheValid = false;
     pthread_mutex_unlock(&gOvLock);
 }
 
@@ -558,6 +594,7 @@ void clock_overlay_set_layout(int landscape, int fullscreen)
     pthread_mutex_lock(&gOvLock);
     gOvLandscape = landscape ? 1 : 0;
     gOvFullscreen = fullscreen ? 1 : 0;
+    gOvCacheValid = false;
     pthread_mutex_unlock(&gOvLock);
 }
 

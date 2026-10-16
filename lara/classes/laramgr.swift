@@ -83,6 +83,7 @@ final class laramgr: ObservableObject {
     @Published var clockrunning: Bool = false
     @Published var clockstatus: String = ""
     @Published var clockstarting: Bool = false      // 正在建浮层：防止并发远程调用
+    @Published var fpvOn: Bool = false              // 「开启」开关的真实状态（唯一驱动源）
 
     var sbProc: RemoteCall?
     var ytProc = RemoteCall(process: "youtube", useMigFilterBypass: false)
@@ -831,7 +832,7 @@ final class laramgr: ObservableObject {
                 self?.clockrunning = ok
                 self?.clockstatus = status
                 self?.logmsg(ok ? "(fpv) \(status)" : "(fpv) 失败：\(status)")
-                if ok { self?.startSnapshotPolling() }
+                if ok { self?.startSnapshotPolling() } else { self?.fpvOn = false }
             }
         }
     }
@@ -873,15 +874,20 @@ final class laramgr: ObservableObject {
     }
 
     /// 「开启」：初始化远程调用 + 启动第一视角浮层，一步到位。
+    /// 用一个独立状态 fpvOn 驱动开关：以前开关绑的是 clockrunning||rcrunning||clockstarting，
+    /// 中途失败后这些中间态会复原，开关看起来却还是"开"，关掉又立刻被算回 true → 死循环。
     func enableAll() {
+        guard !fpvOn else { return }
+        fpvOn = true
         if clockrunning { return }
         if rcready {
             startClock()
             return
         }
-        guard !rcrunning else { return }
+        guard !rcrunning, !clockstarting else { return }
         guard dsready else {
-            clockstatus = "请先初始化"
+            clockstatus = "请先点「初始化」"
+            fpvOn = false
             return
         }
         logmsg("(开启) 初始化远程调用…")
@@ -895,12 +901,14 @@ final class laramgr: ObservableObject {
             } else {
                 self.logmsg("远程调用初始化失败")
                 self.rcfailed = true
+                self.fpvOn = false
             }
         }
     }
 
     /// 「关闭」：停浮层 + 销毁远程调用。
     func disableAll() {
+        fpvOn = false
         stopClock()
         if rcready { rcdestroy() }
     }

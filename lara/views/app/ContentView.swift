@@ -201,12 +201,12 @@ struct ContentView: View {
                     }
                 }) {
                     Toggle("开启", isOn: Binding(
-                        get: { mgr.clockrunning || mgr.rcrunning || mgr.clockstarting },
+                        get: { mgr.fpvOn },
                         set: { on in
                             if on { mgr.enableAll() } else { mgr.disableAll() }
                         }
                     ))
-                    .disabled(!mgr.dsready && !mgr.clockrunning)
+                    .disabled(!mgr.dsready && !mgr.fpvOn)
                 }
 
                 if !mgr.clockstatus.isEmpty {
