@@ -33,7 +33,20 @@ jobs:
       - name: build
         run: |
           chmod +x scripts/build_ipa.sh
-          ./scripts/build_ipa.sh
+          ./scripts/build_ipa.sh || {
+            echo "===== raw xcodebuild: error lines ====="
+            grep -nE "error:|BUILD FAILED|The following build commands failed|Undefined symbols" build/xcodebuild.log | tail -60 || true
+            echo "===== raw xcodebuild: last 120 lines ====="
+            tail -120 build/xcodebuild.log || true
+            exit 1
+          }
+
+      - name: upload xcodebuild log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: build/xcodebuild.log
 
       - name: upload artifact (PR only)
         if: github.event_name == 'pull_request'
