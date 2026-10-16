@@ -71,6 +71,15 @@ static uint64_t gOvDist[OV_MAX_SLOTS];
 static uint64_t gOvCrossH = 0, gOvCrossV = 0;
 static int gOvSlotsAllocated = 0;
 
+/* 增量建方框用的状态（建窗时只建窗口，方框每帧建一对，见 ov_build_slots_step） */
+static int gOvSlotTarget = 0;
+static int gOvBuilderStep = 0;
+static bool gOvBuildFailed = false;
+static bool gOvCrossDone = false;
+static uint64_t gOvFont = 0, gOvWhiteColor = 0, gOvRedCGColor = 0, gOvClearColor = 0;
+static uint64_t gOvClsView = 0, gOvClsLabel = 0;
+static unsigned long gOvCallCount = 0;
+
 /* 每格的上一次下发值：只有真的变了才发远程调用。
    远程调用很贵（每次还打印十几行调试），静止画面下应该几乎不发。 */
 typedef struct { bool used; bool hidden; OV_Rect r; int dist; } OV_SlotCache;
@@ -368,46 +377,25 @@ static bool ov_build(RemoteCall *proc)
     }
     (void)blue; (void)orange;
 
-    /* 方框 + 距离文字
-       注意失败要能看出是哪一步：这里每一步都记录，崩了看日志最后一行就知道。 */
+    /* 方框 + 距离文字：改成「增量创建」。
+       真机日志显示：连续密集远程调用到 ~19 次时目标进程就会崩，
+       一次性建 24 对必崩。所以建窗时一个都不建，之后每帧只建一对，
+       失败也只丢那一格，不会整体失败。字体/颜色缓存起来给后续帧用。 */
     int slots = gOvMaxSlots;
     if (slots < 1) slots = 1;
     if (slots > OV_MAX_SLOTS) slots = OV_MAX_SLOTS;
-    for (int i = 0; i < slots; i++) {
-        OV_Rect r0 = {0, 0, 0, 0};
-        uint64_t box = ov_make_view(clsView, clear, 2.0, redCG, r0, i == 0);
-        if (!r_is_objc_ptr(box)) {
-            ov_status("[5/6] 第 %d 个方框创建失败（box=0x%llx）", i, box);
-            return false;
-        }
-        r_msg2_main(win, "addSubview:", box, 0, 0, 0);
-        gOvBox[i] = box;
-
-        OV_Rect r2 = {0, 0, 0, 0};
-        uint64_t ds = ov_make_label(clsLabel, font, white, clear, 1, r2, i == 0);
-        if (!r_is_objc_ptr(ds)) {
-            ov_status("[5/6] 第 %d 个文字创建失败（label=0x%llx）", i, ds);
-            return false;
-        }
-        r_msg2_main(win, "addSubview:", ds, 0, 0, 0);
-        gOvDist[i] = ds;
-        gOvName[i] = 0;
-    }
-    gOvSlotsAllocated = slots;
-    ov_status("[5/6] 已建 %d 个方框 + %d 个文字", slots, slots);
-
-    /* 准星：两条细线，居中 */
-    {
-        double cx = pw / 2.0, cy = ph / 2.0;
-        OV_Rect h = {cx - 9.0, cy - 0.75, 18.0, 1.5};
-        OV_Rect v = {cx - 0.75, cy - 9.0, 1.5, 18.0};
-        gOvCrossH = ov_make_view(clsView, white, 0.0, 0, h, false);
-        gOvCrossV = ov_make_view(clsView, white, 0.0, 0, v, false);
-        if (r_is_objc_ptr(gOvCrossH)) r_msg2_main(win, "addSubview:", gOvCrossH, 0, 0, 0);
-        if (r_is_objc_ptr(gOvCrossV)) r_msg2_main(win, "addSubview:", gOvCrossV, 0, 0, 0);
-        ov_set_bool(gOvCrossH, "setHidden:", gOvShowCross ? 0 : 1);
-        ov_set_bool(gOvCrossV, "setHidden:", gOvShowCross ? 0 : 1);
-    }
+    gOvSlotTarget   = slots;
+    gOvBuilderStep  = 0;
+    gOvBuildFailed  = false;
+    gOvCrossDone    = false;
+    gOvFont         = font;
+    gOvWhiteColor   = white;
+    gOvRedCGColor   = redCG;
+    gOvClearColor   = clear;
+    gOvClsView      = clsView;
+    gOvClsLabel     = clsLabel;
+    gOvSlotsAllocated = 0;
+    ov_status("[5/6] 窗口已就绪；方框改为增量创建（每帧 1 对，共 %d 对）", slots);
 
     ov_set_bool(win, "setHidden:", 0);
     if (r_responds(win, "resignKeyWindow")) r_msg2_main(win, "resignKeyWindow", 0, 0, 0, 0);
@@ -423,6 +411,62 @@ static bool ov_build(RemoteCall *proc)
     gOvPid = proc.pid;
     gOvCacheValid = false;          /* 新窗口：第一帧全部重发 */
     return r_is_objc_ptr(found) && found == win;
+}
+
+/* 增量建格子：每个 tick 只建一对（方框 + 距离文字），建完再建准星。
+   这样每次只有 5~6 次远程调用，既避免把目标进程压崩，失败也只丢一格。 */
+static void ov_build_slots_step(void)
+{
+    if (!r_is_objc_ptr(gOvWindow)) return;
+
+    if (gOvBuilderStep < gOvSlotTarget) {
+        int i = gOvBuilderStep;
+        OV_Rect r0 = {0, 0, 0, 0};
+        uint64_t box = ov_make_view(gOvClsView, gOvClearColor, 2.0, gOvRedCGColor, r0, i == 0);
+        if (!r_is_objc_ptr(box)) {
+            gOvBuildFailed = true;
+            ov_status("[5/6] 第 %d 个方框创建失败（box=0x%llx，已用调用 %lu 次）", i, box, gOvCallCount);
+            return;
+        }
+        r_msg2_main(gOvWindow, "addSubview:", box, 0, 0, 0);
+        gOvBox[i] = box;
+
+        OV_Rect r2 = {0, 0, 0, 0};
+        uint64_t ds = ov_make_label(gOvClsLabel, gOvFont, gOvWhiteColor, gOvClearColor, 1, r2, i == 0);
+        if (!r_is_objc_ptr(ds)) {
+            gOvBuildFailed = true;
+            ov_status("[5/6] 第 %d 个文字创建失败（label=0x%llx，已用调用 %lu 次）", i, ds, gOvCallCount);
+            return;
+        }
+        r_msg2_main(gOvWindow, "addSubview:", ds, 0, 0, 0);
+        gOvDist[i] = ds;
+        gOvName[i] = 0;
+        gOvCallCount += 6;
+
+        gOvSlotsAllocated = i + 1;
+        gOvBuilderStep = i + 1;
+        if (gOvBuilderStep == 1 || gOvBuilderStep == gOvSlotTarget || gOvBuilderStep % 8 == 0) {
+            ov_status("[5/6] 格子进度 %d/%d（累计远程调用约 %lu 次）",
+                      gOvBuilderStep, gOvSlotTarget, gOvCallCount);
+        }
+        return;
+    }
+
+    if (!gOvCrossDone) {
+        gOvCrossDone = true;
+        double px = 0, py = 0, pw = 0, ph = 0;
+        ov_panel_rect(&px, &py, &pw, &ph);
+        double cx = pw / 2.0, cy = ph / 2.0;
+        OV_Rect h = {cx - 9.0, cy - 0.75, 18.0, 1.5};
+        OV_Rect v = {cx - 0.75, cy - 9.0, 1.5, 18.0};
+        gOvCrossH = ov_make_view(gOvClsView, gOvWhiteColor, 0.0, 0, h, false);
+        gOvCrossV = ov_make_view(gOvClsView, gOvWhiteColor, 0.0, 0, v, false);
+        if (r_is_objc_ptr(gOvCrossH)) r_msg2_main(gOvWindow, "addSubview:", gOvCrossH, 0, 0, 0);
+        if (r_is_objc_ptr(gOvCrossV)) r_msg2_main(gOvWindow, "addSubview:", gOvCrossV, 0, 0, 0);
+        if (r_is_objc_ptr(gOvCrossH)) r_msg2_main(gOvCrossH, "setHidden:", gOvShowCross ? 0 : 1, 0, 0, 0);
+        if (r_is_objc_ptr(gOvCrossV)) r_msg2_main(gOvCrossV, "setHidden:", gOvShowCross ? 0 : 1, 0, 0, 0);
+        ov_status("[5/6] 全部 %d 格 + 准星就绪（累计远程调用约 %lu 次）", gOvSlotsAllocated, gOvCallCount);
+    }
 }
 
 #pragma mark - 每帧绘制
@@ -545,6 +589,12 @@ static void ov_tick(void)
     if (!gOvRunning) { pthread_mutex_unlock(&gOvLock); return; }
 
     ov_log_mute();                 /* 帧内静音，避免 (rc)/(pac) 刷爆日志 */
+    /* 先增量把方框/准星建起来（每帧一对），再画这一帧 */
+    if (!gOvBuildFailed && !(gOvBuilderStep >= gOvSlotTarget && gOvCrossDone)) {
+        ov_log_unmute();           /* 建格子阶段要留日志，方便定位崩在哪 */
+        ov_build_slots_step();
+        ov_log_mute();
+    }
     int drawn = ov_draw_snapshot();
     ov_log_unmute();
 
