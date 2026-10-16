@@ -51,6 +51,7 @@
 #define OV_DEFAULT_EYE        1.60
 #define OV_PERSON_HEIGHT      1.80                    /* 米 */
 #define OV_MIN_BOX_PX         24.0
+#define OV_PANEL_MIN_VISIBLE  60.0                    /* 裁剪区至少留这么多高度在屏内 */
 #define OV_NAME_TEXT_MAX      32
 
 /* 原生绘制用的几何（目标侧坐标） */
@@ -294,12 +295,19 @@ static void ov_panel_rect(double *px, double *py, double *pw, double *ph)
     double width = W * gOvWidthRatio;
     if (width < 200.0) width = W * 0.92;
     if (width > W) width = W;
+    /* 顶边必须留在屏内（至少留 OV_PANEL_MIN_VISIBLE 可见）：
+       否则把「顶部距离」拉到屏幕高度以外，整层会被裁到屏幕外，什么都看不到。 */
+    double top = gOvTop;
+    double maxTop = H - OV_PANEL_MIN_VISIBLE;
+    if (maxTop < 0) maxTop = 0;
+    if (top > maxTop) top = maxTop;
+    if (top < 0) top = 0;
     double height = (gOvHeightRatio > 0.0) ? H * gOvHeightRatio : width * 9.0 / 16.0;
-    double maxH = H - gOvTop - 20.0;
+    double maxH = H - top - 20.0;
     if (height > maxH) height = maxH;
-    if (height < 60.0) height = 60.0;
+    if (height < OV_PANEL_MIN_VISIBLE) height = OV_PANEL_MIN_VISIBLE;
     *px = (W - width) / 2.0;
-    *py = gOvTop;
+    *py = top;
     *pw = width;
     *ph = height;
 }
@@ -449,17 +457,15 @@ static bool ov_build(RemoteCall *proc)
     gOvClsView      = clsView;
     gOvClsLabel     = clsLabel;
     gOvSlotsAllocated = 0;
-    ov_status("[5/6] 窗口已就绪；开始建 %d 个方框（每对之间 20ms，避免压崩目标）", slots);
+    ov_status("[5/6] 窗口已就绪；先建准星，再建 %d 个方框（每步之间 20ms，避免压崩目标）", slots);
 
-    /* 一次性建完，但每对之间歇 20ms：
-       连续密集远程调用到 ~19 次目标就会崩，而纯粹靠"每帧建一对"又要求 lara 一直前台
-       （用户切到游戏后 lara 被挂起，格子就永远建不完）。带节奏地建，约 0.5~0.8 秒
-       就在前台期间全部建好。 */
-    for (int i = 0; i < slots && !gOvBuildFailed; i++) {
+    /* 每步只有 5~6 次远程调用（连续密集调用到 ~19 次目标就会崩）。
+       第一步建准星（立刻可见），其后 %d 步每步建一对（方框+距离文字）。
+       带节奏地建，约 0.5~0.8 秒就在前台期间全部建好。 */
+    for (int i = 0; i <= slots && !gOvBuildFailed; i++) {
         ov_build_slots_step();
-        usleep(20 * 1000);
+        if (!gOvBuildFailed) usleep(20 * 1000);
     }
-    if (!gOvBuildFailed) ov_build_slots_step();      /* 补上准星 */
 
     ov_set_bool(win, "setHidden:", 0);
     if (r_responds(win, "resignKeyWindow")) r_msg2_main(win, "resignKeyWindow", 0, 0, 0, 0);
@@ -477,11 +483,36 @@ static bool ov_build(RemoteCall *proc)
     return r_is_objc_ptr(found) && found == win;
 }
 
-/* 增量建格子：每个 tick 只建一对（方框 + 距离文字），建完再建准星。
-   这样每次只有 5~6 次远程调用，既避免把目标进程压崩，失败也只丢一格。 */
+/* 增量建层：**先建准星**，再一格一格建方框+文字。
+   准星钉在屏幕正中、不裁剪，所以哪怕建方框的过程被打断（切到游戏后 lara 被挂起），
+   画面上也一定先有一个准星可见；方框按 20ms 一格慢慢补，避免把目标进程压崩。 */
 static void ov_build_slots_step(void)
 {
     if (!r_is_objc_ptr(gOvWindow)) return;
+
+    if (!gOvCrossDone) {
+        double sw = 0, sh = 0;
+        ov_screen_wh(&sw, &sh);
+        double cx = sw / 2.0, cy = sh / 2.0;               /* 准星钉在屏幕正中（和游戏准星重合） */
+        OV_Rect h = {cx - 9.0, cy - 0.75, 18.0, 1.5};
+        OV_Rect v = {cx - 0.75, cy - 9.0, 1.5, 18.0};
+        gOvCrossH = ov_make_view(gOvClsView, gOvWhiteColor, 0.0, 0, h, false);
+        gOvCrossV = ov_make_view(gOvClsView, gOvWhiteColor, 0.0, 0, v, false);
+        if (!r_is_objc_ptr(gOvCrossH) || !r_is_objc_ptr(gOvCrossV)) {
+            gOvBuildFailed = true;
+            ov_status("[5/6] 准星创建失败（h=0x%llx v=0x%llx，已用调用 %lu 次）",
+                      gOvCrossH, gOvCrossV, gOvCallCount);
+            return;
+        }
+        r_msg2_main(gOvWindow, "addSubview:", gOvCrossH, 0, 0, 0);
+        r_msg2_main(gOvWindow, "addSubview:", gOvCrossV, 0, 0, 0);
+        r_msg2_main(gOvCrossH, "setHidden:", gOvShowCross ? 0 : 1, 0, 0, 0);
+        r_msg2_main(gOvCrossV, "setHidden:", gOvShowCross ? 0 : 1, 0, 0, 0);
+        gOvCrossCx = cx; gOvCrossCy = cy;
+        gOvCrossDone = true;
+        ov_status("[5/6] 准星就绪：屏幕正中 %.0f,%.0f（累计远程调用约 %lu 次）", cx, cy, gOvCallCount);
+        return;
+    }
 
     if (gOvBuilderStep < gOvSlotTarget) {
         int i = gOvBuilderStep;
@@ -515,23 +546,6 @@ static void ov_build_slots_step(void)
                       gOvBuilderStep, gOvSlotTarget, gOvCallCount);
         }
         return;
-    }
-
-    if (!gOvCrossDone) {
-        gOvCrossDone = true;
-        double sw = 0, sh = 0;
-        ov_screen_wh(&sw, &sh);
-        double cx = sw / 2.0, cy = sh / 2.0;               /* 准星钉在屏幕正中（和游戏准星重合） */
-        OV_Rect h = {cx - 9.0, cy - 0.75, 18.0, 1.5};
-        OV_Rect v = {cx - 0.75, cy - 9.0, 1.5, 18.0};
-        gOvCrossH = ov_make_view(gOvClsView, gOvWhiteColor, 0.0, 0, h, false);
-        gOvCrossV = ov_make_view(gOvClsView, gOvWhiteColor, 0.0, 0, v, false);
-        if (r_is_objc_ptr(gOvCrossH)) r_msg2_main(gOvWindow, "addSubview:", gOvCrossH, 0, 0, 0);
-        if (r_is_objc_ptr(gOvCrossV)) r_msg2_main(gOvWindow, "addSubview:", gOvCrossV, 0, 0, 0);
-        if (r_is_objc_ptr(gOvCrossH)) r_msg2_main(gOvCrossH, "setHidden:", gOvShowCross ? 0 : 1, 0, 0, 0);
-        if (r_is_objc_ptr(gOvCrossV)) r_msg2_main(gOvCrossV, "setHidden:", gOvShowCross ? 0 : 1, 0, 0, 0);
-        gOvCrossCx = cx; gOvCrossCy = cy;
-        ov_status("[5/6] 全部 %d 格 + 准星就绪（累计远程调用约 %lu 次）", gOvSlotsAllocated, gOvCallCount);
     }
 }
 
