@@ -351,35 +351,45 @@ static bool ov_build(RemoteCall *proc)
         }
     }
     uint64_t white = 0, red = 0, blue = 0, orange = 0;
+    uint64_t whiteCG = 0, redCG = 0;
     if (r_is_objc_ptr(clsColor)) {
         white  = r_msg2_main(clsColor, "whiteColor", 0, 0, 0, 0);
         red    = r_msg2_main(clsColor, "systemRedColor", 0, 0, 0, 0);
         blue   = r_msg2_main(clsColor, "systemBlueColor", 0, 0, 0, 0);
         orange = r_msg2_main(clsColor, "systemOrangeColor", 0, 0, 0, 0);
+        /* layer.borderColor 要的是 CGColor（CFTypeRef）：直接传 UIColor 会把目标弄崩 */
+        if (r_is_objc_ptr(white)) whiteCG = r_msg2_main(white, "CGColor", 0, 0, 0, 0);
+        if (r_is_objc_ptr(red))   redCG   = r_msg2_main(red, "CGColor", 0, 0, 0, 0);
     }
+    (void)blue; (void)orange;
 
-    /* 方框 + 名字 + 距离 */
+    /* 方框 + 距离文字
+       注意失败要能看出是哪一步：这里每一步都记录，崩了看日志最后一行就知道。 */
     int slots = gOvMaxSlots;
     if (slots < 1) slots = 1;
     if (slots > OV_MAX_SLOTS) slots = OV_MAX_SLOTS;
     for (int i = 0; i < slots; i++) {
         OV_Rect r0 = {0, 0, 0, 0};
-        uint64_t box = ov_make_view(clsView, clear, 2.0, red, r0);
-        if (!r_is_objc_ptr(box)) return false;
+        uint64_t box = ov_make_view(clsView, clear, 2.0, redCG, r0);
+        if (!r_is_objc_ptr(box)) {
+            ov_status("[5/6] 第 %d 个方框创建失败（box=0x%llx）", i, box);
+            return false;
+        }
         r_msg2_main(win, "addSubview:", box, 0, 0, 0);
         gOvBox[i] = box;
 
-        OV_Rect r1 = {0, 0, 0, 0};
-        uint64_t nm = ov_make_label(clsLabel, font, white, clear, 1 /* center */, r1);
-        if (r_is_objc_ptr(nm)) r_msg2_main(win, "addSubview:", nm, 0, 0, 0);
-        gOvName[i] = nm;
-
         OV_Rect r2 = {0, 0, 0, 0};
         uint64_t ds = ov_make_label(clsLabel, font, white, clear, 1, r2);
-        if (r_is_objc_ptr(ds)) r_msg2_main(win, "addSubview:", ds, 0, 0, 0);
+        if (!r_is_objc_ptr(ds)) {
+            ov_status("[5/6] 第 %d 个文字创建失败（label=0x%llx）", i, ds);
+            return false;
+        }
+        r_msg2_main(win, "addSubview:", ds, 0, 0, 0);
         gOvDist[i] = ds;
+        gOvName[i] = 0;
     }
     gOvSlotsAllocated = slots;
+    ov_status("[5/6] 已建 %d 个方框 + %d 个文字", slots, slots);
 
     /* 准星：两条细线，居中 */
     {

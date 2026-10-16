@@ -878,6 +878,13 @@ final class laramgr: ObservableObject {
     /// 中途失败后这些中间态会复原，开关看起来却还是"开"，关掉又立刻被算回 true → 死循环。
     func enableAll() {
         guard !fpvOn else { return }
+        // 上次失败后已上锁：不再反复重试（否则你每拨一次开关都会重新冲击一次远程会话）
+        if clock_overlay_failed() {
+            fpvOn = false
+            clockstatus = String(cString: clock_overlay_status())
+            logmsg("(开启) 已上锁，不重试：请在第一视角页按「重新自检并显示」")
+            return
+        }
         fpvOn = true
         if clockrunning { return }
         if rcready {
