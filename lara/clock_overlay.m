@@ -842,6 +842,12 @@ static void ov_start_timer(RemoteCall *proc)
                               OV_TICK_MS * NSEC_PER_MSEC, 2 * NSEC_PER_MSEC);
     dispatch_source_set_event_handler(t, ^{ ov_tick(); });
     gOvTimer = t;
+    /* 永久静音：远程调用每次打印十几行 (rc)/(pac)，10Hz 下足以把 lara 的 Logger 压爆。
+       真机证据链是「日志暴量 → lara 被系统杀（SIGKILL，无尸体）→ 木马线程来不及做
+       pthread_exit 清理 → SpringBoard 留在坏状态跟着崩」。所以启动定时器后就一直静音，
+       诊断改走 ov_status（内部写保留的 gOvLogFd，不受静音影响）与崩溃面包屑。 */
+    ov_log_mute();
+    ov_status("已永久静音远程调用日志（诊断改走状态行与 %s）", gOvCrumbPath[0] ? gOvCrumbPath : "面包屑");
     dispatch_resume(gOvTimer);
     (void)proc;
 }

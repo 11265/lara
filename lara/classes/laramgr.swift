@@ -584,8 +584,12 @@ final class laramgr: ObservableObject {
                     self.rcLastError = nil
                     self.rcrunning = false
                     self.rcready = true
-                    // 远程调用一就绪就自动显示全局悬浮·第一视角
-                    self.startClock()
+                    // 远程调用一就绪就自动显示全局悬浮·第一视角（除非上次是异常退出）
+                    if self.consumeUncleanExitFlag() {
+                        self.fpvOn = false
+                    } else {
+                        self.startClock()
+                    }
                 } else {
                     self.logmsg("remote call init failed on \(process)")
                     let error = RemoteCall.lastInitError()
@@ -811,6 +815,28 @@ final class laramgr: ObservableObject {
         }.resume()
     }
 
+    /// 悬浮层开着的时候，把这个标记写进偏好；正常关闭时清掉。
+    /// 启动时如果发现它还在，说明上次是**异常退出**（崩溃/被系统杀/桌面重启），
+    /// 于是不再自动开启，避免一开就重启、无限循环。
+    private let fpvRunningKey = "fpvWasRunning"
+
+    func noteOverlayStarted() {
+        UserDefaults.standard.set(true, forKey: fpvRunningKey)
+    }
+    func noteOverlayStopped() {
+        UserDefaults.standard.set(false, forKey: fpvRunningKey)
+    }
+    /// 上次是否异常退出（返回 true 时调用方应跳过自动开启）
+    func consumeUncleanExitFlag() -> Bool {
+        let unclean = UserDefaults.standard.bool(forKey: fpvRunningKey)
+        if unclean {
+            UserDefaults.standard.set(false, forKey: fpvRunningKey)
+            logmsg("(fpv) 检测到上次异常退出（可能是浮层导致的桌面重启），本次不自动开启；"
+                   + "要试请在首页手动打开「开启」")
+        }
+        return unclean
+    }
+
     func startClock() {
         guard dsready, let sbProc, !clockrunning, !clockstarting else { return }
         // 上次把远程会话弄坏后就上锁：不再自动重试，避免反复冲击参数缓冲区把 SpringBoard 打崩
@@ -828,6 +854,7 @@ final class laramgr: ObservableObject {
         pushOverlayConfig()
         logmsg("(fpv) 启动原生绘制浮层：数据源 \(fpvDataBase())/api/state（\(lastLandscape ? "横屏" : "竖屏")\(UserDefaults.standard.bool(forKey: "fpvFullscreen") ? " 全屏" : "")）")
         clockstarting = true
+        noteOverlayStarted()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let ok = clock_overlay_start(sbProc)
             let status = String(cString: clock_overlay_status())
@@ -836,13 +863,14 @@ final class laramgr: ObservableObject {
                 self?.clockrunning = ok
                 self?.clockstatus = status
                 self?.logmsg(ok ? "(fpv) \(status)" : "(fpv) 失败：\(status)")
-                if ok { self?.startSnapshotPolling() } else { self?.fpvOn = false }
+                if ok { self?.startSnapshotPolling() } else { self?.fpvOn = false; self?.noteOverlayStopped() }
             }
         }
     }
 
     func stopClock() {
         guard clockrunning else { return }
+        noteOverlayStopped()
         stopSnapshotPolling()
         guard let sbProc else {
             clockrunning = false
